@@ -1,0 +1,14 @@
+numpy
+psutil
+requests
+tqdm
+pexpect
+rich
+click
+pyyaml
+loguru
+python-dateutil
+
+# *CRITICAL STEP* 
+# Install llama-cpp-python
+# CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall --no-cache-dir --verbose
