@@ -1,0 +1,3 @@
+Put your ai models
+edit the .wavesai/confi/config.json to change model path
+edit wavesai.py to change your llm

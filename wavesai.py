@@ -18,6 +18,11 @@ from typing import Dict, List, Optional
 import threading
 import time
 
+# Import WavesAI modules
+from modules.search_engine import SearchEngine
+from modules.system_monitor import SystemMonitor
+from modules.command_handler import CommandHandler
+
 # Configuration - Load from config file
 def load_config():
     config_path = Path.home() / ".wavesai/config/config.json"
@@ -40,7 +45,7 @@ def load_config():
     
     # Fallback to defaults
     return {
-        "model_path": str(Path.home() / ".wavesai/models/mistral-7b-instruct-v0.1.Q4_K_M.gguf"),
+        "model_path": str(Path.home() / ".wavesai/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"),
         "database": str(Path.home() / ".wavesai/config/memory.db"),
         "log_file": str(Path.home() / ".wavesai/config/logs/wavesai.log"),
         "context_length": 4096,
@@ -58,7 +63,58 @@ class WavesAI:
         self.init_database()
         self.llm = None
         self.conversation_history = []
-        self.system_context = self.get_system_context()
+        
+        # Initialize modules
+        self.search_engine = SearchEngine()
+        self.system_monitor = SystemMonitor()
+        self.command_handler = CommandHandler()
+        
+        self.system_context = self.system_monitor.get_system_context()
+        self.system_prompt_template = self.load_system_prompt()
+    
+    def get_system_context(self):
+        """Wrapper for system_monitor.get_system_context()"""
+        return self.system_monitor.get_system_context()
+    
+    def get_system_alerts(self):
+        """Wrapper for system_monitor.get_system_alerts()"""
+        return self.system_monitor.get_system_alerts()
+    
+    def get_top_processes(self, count: int = 10):
+        """Wrapper for system_monitor.get_top_processes()"""
+        return self.system_monitor.get_top_processes(count)
+    
+    def get_network_stats(self):
+        """Wrapper for system_monitor.get_network_stats()"""
+        return self.system_monitor.get_network_stats()
+    
+    def monitor_process(self, process_name: str = None, pid: int = None):
+        """Wrapper for system_monitor.monitor_process()"""
+        return self.system_monitor.monitor_process(process_name, pid)
+    
+    def get_detailed_system_info(self):
+        """Wrapper for system_monitor.get_detailed_system_info()"""
+        return self.system_monitor.get_detailed_system_info()
+    
+    def search_wikipedia(self, query: str) -> str:
+        """Wrapper for search_engine.search_wikipedia()"""
+        return self.search_engine.search_wikipedia(query)
+    
+    def search_web(self, query: str) -> str:
+        """Wrapper for search_engine.search_web()"""
+        return self.search_engine.search_web(query)
+    
+    def smart_execute(self, user_input: str):
+        """Wrapper for command_handler.smart_execute()"""
+        return self.command_handler.smart_execute(user_input, self.system_context)
+    
+    def is_safe_command(self, command: str) -> bool:
+        """Wrapper for command_handler.is_safe_command()"""
+        return self.command_handler.is_safe_command(command)
+    
+    def execute_command(self, command: str, sudo: bool = False, timeout: int = 30):
+        """Wrapper for command_handler.execute_command()"""
+        return self.command_handler.execute_command(command, sudo, timeout)
         
     def setup_directories(self):
         """Create necessary directories"""
@@ -69,6 +125,16 @@ class WavesAI:
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
+    
+    def load_system_prompt(self) -> str:
+        """Load system prompt from external file"""
+        prompt_path = Path.home() / ".wavesai/system_prompt.txt"
+        try:
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            print(f"[Warning] System prompt file not found at {prompt_path}")
+            return "You are WavesAI, an AI assistant for Arch Linux."
     
     def init_database(self):
         """Initialize SQLite database for persistent memory"""
@@ -324,179 +390,26 @@ class WavesAI:
         except Exception as e:
             return f"Error generating system report: {str(e)}"
     
-    def smart_execute(self, user_input: str) -> Optional[str]:
-        """Handle common queries without AI inference"""
-        lower_input = user_input.lower().strip()
-        
-        # Time/Date queries (only if specifically asking for time)
-        time_keywords = ['what time', 'what is the time', 'tell me the time', 'current time', 
-                        'what\'s the time', 'time is it', 'show time']
-        if any(keyword in lower_input for keyword in time_keywords):
-            info = self.get_system_context()
-            return f"The current time is {info['current_time']}, sir."
-        
-        # System update commands
-        if any(phrase in lower_input for phrase in ['update system', 'update arch', 'system update', 
-                                                      'upgrade system', 'pacman -syu', 'pacman update']):
-            return None  # Let AI handle to generate proper command
-        
-        # Open application
-        if lower_input.startswith('open '):
-            app_command = lower_input.replace('open ', '').strip()
-            
-            # Handle "open X in Y" pattern (e.g., "open nvim in kitty")
-            if ' in ' in app_command:
-                parts = app_command.split(' in ')
-                inner_app = parts[0].strip()
-                terminal = parts[1].strip()
-                
-                # Check if terminal exists
-                check = subprocess.run(f"which {terminal}", shell=True, capture_output=True, text=True)
-                if check.returncode == 0:
-                    subprocess.Popen(f"{terminal} -e {inner_app}", shell=True, 
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return f"Opening {inner_app} in {terminal}, sir."
-                else:
-                    return f"Terminal '{terminal}' is not installed."
-            
-            # Simple app opening - extract just the app name (remove extra words)
-            app = app_command.split()[0]  # Take only the first word as app name
-            check = subprocess.run(f"which {app}", shell=True, capture_output=True, text=True)
-            if check.returncode == 0:
-                subprocess.Popen(app, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return f"Opening {app}, sir."
-            else:
-                return f"Application '{app}' is not installed, sir. Would you like me to install it?"
-        
-        # Close/Kill application
-        if lower_input.startswith('close ') or lower_input.startswith('kill '):
-            app = lower_input.replace('close ', '').replace('kill ', '').replace(' app', '').strip()
-            result = subprocess.run(f"killall {app}", shell=True, capture_output=True, text=True)
-            if result.returncode == 0:
-                return f"Closed {app}, sir."
-            else:
-                return f"Could not find {app} process."
-        
-        # Launch application (alternative command)
-        if lower_input.startswith('launch ') or lower_input.startswith('run '):
-            app = lower_input.replace('launch ', '').replace('run ', '').strip()
-            check = subprocess.run(f"which {app}", shell=True, capture_output=True, text=True)
-            if check.returncode == 0:
-                subprocess.Popen(app, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return f"Launching {app}, sir."
-            else:
-                return f"'{app}' is not found. Shall I search for it?"
-        
-        # Quick system stats
-        if lower_input in ['stats', 'quick status', 'system']:
-            info = self.get_system_context()
-            return f"System Status: CPU {info['cpu_usage']}, RAM {info['ram_usage']}, {info['gpu_info']}"
-        
-        # Detailed system monitoring
-        if lower_input in ['monitor', 'detailed status', 'system report', 'full status']:
-            return self.get_detailed_system_info()
-        
-        # Process monitoring commands
-        if lower_input.startswith('monitor process '):
-            process_name = lower_input.replace('monitor process ', '').strip()
-            result = self.monitor_process(process_name=process_name)
-            if 'error' in result:
-                return f"Process monitoring failed: {result['error']}"
-            else:
-                return f"Process '{result['name']}' (PID: {result['pid']}): {result['cpu_percent']:.1f}% CPU, {result['memory_mb']:.1f}MB RAM, Status: {result['status']}"
-        
-        # System alerts
-        if lower_input in ['alerts', 'warnings', 'system alerts']:
-            alerts = self.get_system_alerts()
-            if alerts:
-                return "System Alerts:\n" + "\n".join(alerts)
-            else:
-                return "No system alerts. All systems operating normally, sir."
-        
-        # Top processes
-        if lower_input in ['top processes', 'top cpu', 'heavy processes']:
-            processes = self.get_top_processes(5)
-            if processes:
-                result = "Top CPU-consuming processes:\n"
-                for i, proc in enumerate(processes, 1):
-                    result += f"{i}. {proc['name']} (PID: {proc['pid']}) - {proc['cpu_percent']:.1f}% CPU, {proc['memory_mb']:.1f}MB RAM\n"
-                return result
-            else:
-                return "Unable to retrieve process information, sir."
-        
-        # Network monitoring
-        if lower_input in ['network', 'network stats', 'connections']:
-            net_stats = self.get_network_stats()
-            if 'error' not in net_stats:
-                return f"Network Status: {net_stats['active_connections']} active connections, {net_stats['bytes_sent'] // (1024*1024)}MB sent, {net_stats['bytes_recv'] // (1024*1024)}MB received"
-            else:
-                return f"Network monitoring failed: {net_stats['error']}"
-        
-        # Handle news queries - actually fetch real news
-        news_keywords = ['latest news', 'current news', 'today news', 'indian news', 'world news', 
-                        'breaking news', 'news today', 'recent news']
-        if any(keyword in lower_input for keyword in news_keywords):
-            # Extract location/country from query
-            location = None
-            if 'indian' in lower_input or 'india' in lower_input:
-                location = 'india'
-            elif 'world' in lower_input:
-                location = 'world'
-            
-            news_result = self.fetch_real_news(location)
-            return news_result if news_result else "I'm having trouble fetching news right now. Please try again or check news websites directly, sir."
-        
-        # Handle specific news source requests (like NDTV)
-        if 'ndtv' in lower_input and any(word in lower_input for word in ['news', 'latest', 'tell']):
-            news_result = self.fetch_real_news('india')
-            return news_result if news_result else "I'm having trouble fetching NDTV news right now. Please try again or check NDTV website directly, sir."
-        
-        # Handle general information requests
-        info_keywords = ['what is', 'who is', 'how to', 'explain', 'tell me about', 'what about', 'details about', 'more about', 'define', 'biography', 'about']
-        if any(keyword in lower_input for keyword in info_keywords):
-            # Extract the topic from the query
-            topic = lower_input
-            for keyword in info_keywords:
-                topic = topic.replace(keyword, '').strip()
-            
-            # Clean up the topic (remove extra words)
-            topic = topic.replace("'s", "").strip()
-            
-            # Get search results and let AI process them conversationally
-            return None  # Let AI handle with search context
-        
-        # Handle Wikipedia-specific queries
-        if lower_input.startswith('wikipedia') or 'wikipedia' in lower_input:
-            # Extract the topic from the query
-            topic = lower_input.replace('wikipedia', '').replace('search', '').strip()
-            if topic:
-                wiki_result = self.search_wikipedia(topic)
-                return wiki_result if wiki_result else f"I couldn't find Wikipedia information about '{topic}'. Please try a different query, sir."
-        
-        # Handle stock/price queries - let AI process search results conversationally
-        stock_keywords = ['stock price', 'crypto price', 'bitcoin price', 'share price', 'market price', 'current price']
-        if any(keyword in lower_input for keyword in stock_keywords):
-            return None  # Let AI handle with search context
-        
-        # Handle weather queries (already handled by weather command, but add safety)
-        weather_keywords = ['weather today', 'weather tomorrow', 'forecast']
-        if any(keyword in lower_input for keyword in weather_keywords) and not lower_input.startswith('weather'):
-            return None  # Let the weather command handle this
-        
-        return None  # Let AI handle
+    # Removed duplicate smart_execute method - now uses command_handler.smart_execute() only
     
     def load_llm(self):
-        """Load Mistral model using llama-cpp-python"""
+        """Load LLM model using llama-cpp-python"""
         try:
             from llama_cpp import Llama
             
-            print("[WavesAI] Loading Mistral 7B model...")
+            # Extract model filename from path
+            model_filename = os.path.basename(CONFIG["model_path"])
+            print(f"[WavesAI] Loading model: {model_filename}")
             
             # Check if model exists
             if not os.path.exists(CONFIG["model_path"]):
                 print(f"[ERROR] Model not found at: {CONFIG['model_path']}")
                 print("Please ensure the model file exists at the specified path.")
                 return False
+            
+            # Show model size
+            model_size_gb = os.path.getsize(CONFIG["model_path"]) / (1024**3)
+            print(f"[WavesAI] Model size: {model_size_gb:.2f} GB")
             
             self.llm = Llama(
                 model_path=CONFIG["model_path"],
@@ -505,7 +418,8 @@ class WavesAI:
                 n_threads=CONFIG["threads"],
                 verbose=False
             )
-            print("[WavesAI] Model loaded successfully with GPU acceleration")
+            print(f"[WavesAI] ✓ {model_filename} loaded successfully with GPU acceleration")
+            print(f"[WavesAI] Context: {CONFIG['context_length']} tokens | GPU Layers: {CONFIG['gpu_layers']} | Threads: {CONFIG['threads']}")
             return True
         except ImportError:
             print("[ERROR] llama-cpp-python not installed. Install with:")
@@ -516,7 +430,7 @@ class WavesAI:
             return False
     
     def generate_response(self, user_input: str) -> str:
-        """Generate AI response using Mistral model with search context"""
+        """Generate AI response using loaded LLM with search context"""
         if not self.llm:
             return "Error: Model not loaded"
         
@@ -546,68 +460,32 @@ class WavesAI:
             except:
                 pass
         
-        system_prompt = f"""You are WavesAI, a highly advanced AI assistant like JARVIS from Iron Man, running on Arch Linux.
-
-Current System Status:
-- User: {system_info['username']}@{system_info['hostname']}
+        # Format system status for the prompt
+        system_status = f"""- User: {system_info['username']}@{system_info['hostname']}
 - CPU: {system_info['cpu_usage']} | Temp: {system_info['cpu_temp']}
 - RAM: {system_info['ram_usage']}
 - {system_info['gpu_info']}
 - Uptime: {system_info['uptime']}
-- Time: {system_info['current_time']}
+- Time: {system_info['current_time']}"""
+        
+        # Load system prompt from file and inject system status
+        system_prompt = self.system_prompt_template.replace("{system_status}", system_status)
 
-KNOWLEDGE SOURCES:
-- Wikipedia: Full access to Wikipedia knowledge base for comprehensive information
-- Web Search: Real-time web search for current information and news
-- System Information: Real-time system stats and status
+        # Llama 3.1 prompt format (without <|begin_of_text|> - model adds it automatically)
+        prompt = f"""<|start_header_id|>system<|end_header_id|>
 
-CRITICAL VOICE ASSISTANT RULES:
-1. Respond CONVERSATIONALLY like JARVIS - brief, natural, helpful
-2. NEVER show code blocks, commands, or technical output to the user
-3. Execute commands silently in the background
-4. Just confirm what you did: "Done, sir" or "File created" or "Opening Firefox"
-5. For time queries: Just state the time naturally
-6. For system info: Give clean stats without mentioning how you got them
-7. Address user as "sir" occasionally
-8. Keep responses SHORT but informative (2-4 sentences for complex topics)
-9. Sound professional, efficient, and confident like JARVIS
-10. If something fails, say what went wrong briefly
-11. NEVER claim to have done something you didn't actually do
-12. If you don't have access to real-time data, be honest about it
-13. For search queries: Process the information and respond conversationally, don't dump raw data
+{system_prompt}{search_context}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
-SEARCH RESPONSE RULES:
-- When you have search results (Wikipedia + Web), synthesize the information into a natural response
-- Wikipedia provides authoritative, comprehensive information
-- Web search provides current, recent information
-- Combine both sources intelligently for complete answers
-- Explain things conversationally, like you're talking to someone
-- Don't just list facts - provide context and explanation
-- Make it sound like you actually know the information, not like you're reading from a search
+{user_input}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
-EXAMPLES:
-User: "Who is Mukesh Ambani?"
-Good: "Mukesh Ambani is an Indian billionaire businessman and chairman of Reliance Industries. He's one of the richest people in the world with a net worth over $90 billion. He's known for transforming Reliance into India's largest private sector company, sir."
-Bad: "**Mukesh Ambani:** Mukesh Dhirubhai Ambani is an Indian billionaire businessman..."
-
-User: "What is artificial intelligence?"
-Good: "Artificial intelligence is technology that enables machines to perform tasks that typically require human intelligence, like learning, reasoning, and problem-solving. It's being used in everything from smartphones to self-driving cars, sir."
-Bad: "**Definition:** Artificial intelligence (AI) is..."
-
-Be like JARVIS: smooth, efficient, conversational, and knowledgeable."""
-
-        prompt = f"""[INST] {system_prompt}{search_context}
-
-User: {user_input}
-
-Respond naturally and conversationally. Process any search results into a smooth, informative response. [/INST]"""
+"""
 
         try:
             response = self.llm(
                 prompt,
                 max_tokens=CONFIG["max_tokens"],
                 temperature=CONFIG["temperature"],
-                stop=["[INST]", "</s>", "[You]", "User:", "```"],
+                stop=["<|eot_id|>", "<|end_of_text|>", "User:", "[You]"],
                 echo=False
             )
             return response['choices'][0]['text'].strip()
@@ -1329,6 +1207,13 @@ Respond naturally and conversationally. Process any search results into a smooth
     def startup_briefing(self):
         """Display startup information with enhanced monitoring"""
         info = self.get_system_context()
+        
+        # Handle error case
+        if 'error' in info:
+            print(f"\n\033[1;31m[WavesAI Error]\033[0m ➜ System monitoring failed: {info['error']}")
+            print("\n\033[1;32m[WavesAI]\033[0m ➜ System initialized with limited monitoring.")
+            return
+        
         weather = self.get_weather()
         alerts = self.get_system_alerts()
         
@@ -1338,19 +1223,19 @@ Respond naturally and conversationally. Process any search results into a smooth
 ║              Enhanced Monitoring Active                  ║
 ╚══════════════════════════════════════════════════════════╝
 
-Good day, {info['username']}. WavesAI systems initialized with full monitoring.
+Good day, {info.get('username', 'sir')}. WavesAI systems initialized with full monitoring.
 
 System Status:
-  • CPU Usage: {info['cpu_usage']} | Temperature: {info['cpu_temp']}
-  • Memory: {info['ram_usage']}
-  • {info['gpu_info']}
-  • Disk: {info['disk_usage']}
-  • Uptime: {info['uptime']}
-  • Processes: {info['process_count']} active
-  • Load Average: {info['load_avg']}
+  • CPU Usage: {info.get('cpu_usage', 'N/A')} | Temperature: {info.get('cpu_temp', 'N/A')}
+  • Memory: {info.get('ram_usage', 'N/A')}
+  • {info.get('gpu_info', 'GPU: N/A')}
+  • Disk: {info.get('disk_usage', 'N/A')}
+  • Uptime: {info.get('uptime', 'N/A')}
+  • Processes: {info.get('process_count', 'N/A')} active
+  • Load Average: {info.get('load_avg', 'N/A')}
 
 Weather: {weather}
-Time: {info['current_time']}
+Time: {info.get('current_time', 'N/A')}
 
 Monitoring Commands Available:
   • 'monitor' - Detailed system report
@@ -1414,11 +1299,10 @@ How may I assist you?
                     print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Let me look that up for you, sir.")
                     # Continue to AI processing below
                 
-                # Try smart execution first
+                # Try smart_execute first for direct commands
                 smart_response = self.smart_execute(user_input)
                 if smart_response:
                     print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {smart_response}")
-                    self.save_interaction(user_input, smart_response)
                     continue
                 
                 # Generate AI response
@@ -1426,9 +1310,41 @@ How may I assist you?
                 response = self.generate_response(user_input)
                 # Validate response to prevent hallucinations
                 response = self.validate_response(user_input, response)
+                
+                # Check if AI wants to execute a command
+                if "EXECUTE_COMMAND:" in response:
+                    command = response.split("EXECUTE_COMMAND:")[1].strip().split()[0] if " " in response.split("EXECUTE_COMMAND:")[1] else response.split("EXECUTE_COMMAND:")[1].strip()
+                    # Extract full command line
+                    cmd_start = response.find("EXECUTE_COMMAND:") + 16
+                    cmd_end = response.find("\n", cmd_start) if "\n" in response[cmd_start:] else len(response)
+                    command = response[cmd_start:cmd_end].strip()
+                    
+                    print(f"\033[1;35m[WavesAI]\033[0m ➜ Executing: {command}                    ")
+                    
+                    # Ask for confirmation for dangerous commands
+                    dangerous_keywords = ['reboot', 'shutdown', 'poweroff', 'halt', 'rm -rf', 'mkfs', 'dd']
+                    if any(keyword in command.lower() for keyword in dangerous_keywords):
+                        confirm = input(f"\n\033[1;33m[Confirm?]\033[0m This command will affect the system. Continue? (y/n): ")
+                        if confirm.lower() != 'y':
+                            print("\n\033[1;33m[Cancelled]\033[0m Command not executed.")
+                            continue
+                    
+                    # Execute the command
+                    result = self.execute_command(command)
+                    if result['success']:
+                        if result['output']:
+                            print(f"\n\033[1;32m[Output]\033[0m\n{result['output']}")
+                        else:
+                            print(f"\n\033[1;32m[Success]\033[0m Done, sir.")
+                    else:
+                        print(f"\n\033[1;31m[Error]\033[0m {result['error']}")
+                    
+                    self.save_interaction(user_input, f"Executed: {command}", command)
+                    continue
+                
                 print(f"\033[1;35m[WavesAI]\033[0m ➜ {response}                    ")
                 
-                # Check if response contains commands
+                # Check if response contains bash code blocks
                 if "```bash" in response:
                     cmd_start = response.find("```bash") + 7
                     cmd_end = response.find("```", cmd_start)
