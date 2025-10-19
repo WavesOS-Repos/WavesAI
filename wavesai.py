@@ -542,40 +542,7 @@ class WavesAI:
         
         return None
     
-    def execute_command(self, command: str, sudo: bool = False, timeout: int = 30) -> Dict:
-        """Execute shell command with safety checks"""
-        dangerous_commands = ['rm -rf /', 'mkfs', 'dd if=', ':(){:|:&};:', 'chmod -R 777 /', '> /dev/sda']
-        
-        for dangerous in dangerous_commands:
-            if dangerous in command:
-                return {"success": False, "error": "Dangerous command blocked for safety"}
-        
-        try:
-            # Check if command needs sudo interaction
-            if 'sudo' in command:
-                print("\n\033[1;33m[Warning]\033[0m Command requires sudo password. You have 60 seconds to enter it.")
-                timeout = 60  # Increase timeout for sudo commands
-            
-            if sudo and not command.startswith('sudo'):
-                command = f"sudo {command}"
-            
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            
-            return {
-                "success": result.returncode == 0,
-                "output": result.stdout,
-                "error": result.stderr
-            }
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Command timed out (may need user input)"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    # Removed duplicate execute_command - using command_handler.execute_command() instead
     
     def validate_response(self, user_input: str, ai_response: str) -> str:
         """Validate AI response to prevent hallucinations"""
@@ -1334,6 +1301,13 @@ How may I assist you?
                     if result['success']:
                         if result['output']:
                             print(f"\n\033[1;32m[Output]\033[0m\n{result['output']}")
+                            
+                            # For resource monitoring commands, ask AI to provide a summary
+                            monitoring_keywords = ['ps aux', 'du -', 'df -', 'free', 'top -', 'htop', 'awk', 'grep']
+                            if any(keyword in command.lower() for keyword in monitoring_keywords):
+                                summary_prompt = f"The user asked: '{user_input}'\nCommand executed: {command}\nOutput:\n{result['output']}\n\nProvide a brief, conversational summary of this information like JARVIS would."
+                                summary = self.generate_response(summary_prompt)
+                                print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {summary}")
                         else:
                             print(f"\n\033[1;32m[Success]\033[0m Done, sir.")
                     else:
