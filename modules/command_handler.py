@@ -9,6 +9,7 @@ import subprocess
 from typing import Optional, Dict
 from .pacman_handler import PacmanHandler
 from .process_detector import ProcessDetector
+from .error_analyzer import get_error_analyzer
 
 
 class CommandHandler:
@@ -44,6 +45,16 @@ class CommandHandler:
         # Launch application
         if lower_input.startswith('launch ') or lower_input.startswith('run '):
             return self._handle_launch_command(lower_input)
+        
+        # News queries - let AI handle with search context
+        news_keywords = ['latest news', 'indian news', 'world news', 'breaking news', 'news today', 'current news']
+        if any(keyword in lower_input for keyword in news_keywords):
+            return None  # Let AI handle with search context
+        
+        # Weather queries - let AI handle with weather context
+        weather_keywords = ['weather', 'temperature', 'climate', 'forecast', 'rain', 'sunny', 'cloudy']
+        if any(keyword in lower_input for keyword in weather_keywords):
+            return None  # Let AI handle with weather context
         
         # Quick system stats
         if lower_input in ['stats', 'quick status', 'system']:
@@ -310,12 +321,38 @@ class CommandHandler:
                     timeout=timeout
                 )
                 
-                return {
-                    "success": result.returncode == 0,
-                    "output": result.stdout,
-                    "error": result.stderr
-                }
+                if result.returncode == 0:
+                    return {
+                        "success": True,
+                        "output": result.stdout,
+                        "error": ""
+                    }
+                else:
+                    # Analyze error and provide intelligent solution
+                    error_analyzer = get_error_analyzer()
+                    error_analysis = error_analyzer.analyze_error(result.stderr, command)
+                    
+                    return {
+                        "success": False,
+                        "output": result.stdout,
+                        "error": result.stderr,
+                        "error_analysis": error_analysis
+                    }
         except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Command timed out (may need user input)"}
+            return {
+                "success": False,
+                "error": "Command timed out (may need user input)",
+                "error_analysis": {
+                    "summary": "Command timeout",
+                    "solution": "The command took too long. It may require user input or be stuck.",
+                    "category": "timeout"
+                }
+            }
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            error_analyzer = get_error_analyzer()
+            error_analysis = error_analyzer.analyze_error(str(e), command)
+            return {
+                "success": False,
+                "error": str(e),
+                "error_analysis": error_analysis
+            }

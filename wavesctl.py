@@ -5,240 +5,179 @@ Usage: wavesctl <command> [args]
 """
 
 import sys
+import os
 import argparse
 from pathlib import Path
 
-# Import modules
-sys.path.insert(0, str(Path.home() / ".local/share/wavesai"))
-from modules import *
+# Add WavesAI directory to path
+wavesai_dir = Path.home() / ".wavesai"
+sys.path.insert(0, str(wavesai_dir))
+
+from modules.system_monitor import SystemMonitor
+from modules.command_handler import CommandHandler
+from modules.search_engine import SearchEngine
+from modules.process_detector import ProcessDetector
+from modules.location_weather import LocationWeatherService
 
 class WavesAICLI:
     def __init__(self):
-        self.system = SystemModule()
-        self.package = PackageModule()
-        self.process = ProcessModule()
-        self.service = ServiceModule()
-        self.network = NetworkModule()
-        self.file = FileModule()
-        self.dev = DevelopmentModule()
-        self.media = MediaModule()
-        self.automation = AutomationModule()
+        self.system_monitor = SystemMonitor()
+        self.command_handler = CommandHandler()
+        self.search_engine = SearchEngine()
+        self.process_detector = ProcessDetector()
+        self.location_weather = LocationWeatherService()
+        
+        # Set user's actual location for CLI tool
+        try:
+            from user_location import setup_user_location
+            setup_user_location(self.location_weather)
+        except ImportError:
+            pass
     
     def cmd_status(self, args):
         """Show system status"""
-        stats = self.system.get_detailed_stats()
+        stats = self.system_monitor.get_system_context()
         
         print("\n╔═══════════════════════════════════════════╗")
         print("║         WavesAI System Status             ║")
         print("╚═══════════════════════════════════════════╝\n")
         
-        # CPU
-        cpu_avg = sum(stats['cpu']['percent']) / len(stats['cpu']['percent'])
-        print(f"CPU: {cpu_avg:.1f}% | Cores: {stats['cpu']['count']}")
-        
-        # Memory
-        mem = stats['memory']['virtual']
-        print(f"RAM: {mem['percent']:.1f}% ({mem['used']/(1024**3):.1f}GB / {mem['total']/(1024**3):.1f}GB)")
-        
-        # Disk
-        for disk in stats['disk']:
-            usage = disk['usage']
-            print(f"Disk {disk['mountpoint']}: {usage['percent']:.1f}% ({usage['used']/(1024**3):.1f}GB / {usage['total']/(1024**3):.1f}GB)")
-        
-        # Processes
-        print(f"Processes: {stats['processes']}")
-        
-        # Temperature
-        temps = self.system.get_temperature()
-        if temps:
-            for sensor, readings in temps.items():
-                for reading in readings[:1]:  # First reading only
-                    print(f"Temperature ({sensor}): {reading['current']:.1f}°C")
-        
+        print(f"User: {stats['username']}@{stats['hostname']}")
+        print(f"CPU: {stats['cpu_usage']} | Temp: {stats['cpu_temp']}")
+        print(f"RAM: {stats['ram_usage']}")
+        print(f"GPU: {stats['gpu_info']}")
+        print(f"Uptime: {stats['uptime']}")
+        print(f"Time: {stats['current_time']}")
+        print(f"{stats.get('location', 'Location: Unknown')}")
         print()
     
     def cmd_top(self, args):
         """Show top processes"""
-        sort_by = args.sort if hasattr(args, 'sort') else 'cpu'
-        processes = self.process.list_processes(sort_by)
+        processes = self.process_detector.get_all_processes()[:20]
         
-        print(f"\nTop 20 Processes (by {sort_by}):\n")
-        print(f"{'PID':<8} {'NAME':<30} {'CPU%':<8} {'MEM%':<8} {'STATUS':<12}")
+        print(f"\nTop 20 Processes:\n")
+        print(f"{'PID':<8} {'NAME':<30} {'CPU%':<8} {'MEM%':<8} {'USER':<12}")
         print("="*70)
         
         for proc in processes:
-            print(f"{proc['pid']:<8} {proc['name'][:30]:<30} {proc['cpu_percent']:<8.1f} {proc['memory_percent']:<8.1f} {proc['status']:<12}")
+            print(f"{proc['pid']:<8} {proc['name'][:30]:<30} {proc['cpu']:<8} {proc['mem']:<8} {proc['user']:<12}")
         print()
-    
-    def cmd_services(self, args):
-        """List systemd services"""
-        state = args.state if hasattr(args, 'state') else 'all'
-        output = self.service.list_services(state)
-        print(output)
-    
-    def cmd_network(self, args):
-        """Show network information"""
-        info = self.network.get_network_info()
-        
-        print("\n╔═══════════════════════════════════════════╗")
-        print("║         Network Information               ║")
-        print("╚═══════════════════════════════════════════╝\n")
-        
-        # Interfaces
-        for iface, addrs in info['interfaces'].items():
-            print(f"Interface: {iface}")
-            for addr in addrs:
-                if addr['family'].name == 'AF_INET':
-                    print(f"  IPv4: {addr['address']}")
-                elif addr['family'].name == 'AF_INET6':
-                    print(f"  IPv6: {addr['address'][:30]}")
-            print()
-        
-        # Public IP
-        public_ip = self.network.get_public_ip()
-        print(f"Public IP: {public_ip}\n")
-        
-        # IO Stats
-        io = info['io_counters']
-        print(f"Sent: {io['bytes_sent']/(1024**2):.2f} MB")
-        print(f"Received: {io['bytes_recv']/(1024**2):.2f} MB\n")
-    
-    def cmd_search(self, args):
-        """Search for files"""
-        if not args.pattern:
-            print("Error: Please provide a search pattern")
-            return
-        
-        directory = args.directory if hasattr(args, 'directory') else '.'
-        results = self.file.search_files(args.pattern, directory)
-        
-        print(f"\nSearching for: {args.pattern}\n")
-        for result in results:
-            if result:
-                print(result)
-        print()
-    
-    def cmd_package(self, args):
-        """Package management"""
-        if args.action == 'search':
-            output = self.package.search_package(args.name)
-            print(output)
-        elif args.action == 'install':
-            print(f"Installing {args.name}...")
-            result = self.package.install_package(args.name, args.yay)
-            print(result.stdout if result.returncode == 0 else result.stderr)
-        elif args.action == 'remove':
-            print(f"Removing {args.name}...")
-            result = self.package.remove_package(args.name)
-            print(result.stdout if result.returncode == 0 else result.stderr)
-        elif args.action == 'update':
-            print("Updating system...")
-            result = self.package.update_system()
-            print(result.stdout if result.returncode == 0 else result.stderr)
-        elif args.action == 'clean':
-            print("Cleaning cache...")
-            results = self.package.clean_cache()
-            for result in results:
-                print(result.stdout)
-    
-    def cmd_git(self, args):
-        """Git operations"""
-        if args.action == 'status':
-            output = self.dev.git_status(args.path if hasattr(args, 'path') else '.')
-            print(output)
-        elif args.action == 'commit':
-            if not hasattr(args, 'message'):
-                print("Error: Commit message required")
-                return
-            output = self.dev.git_commit(args.path if hasattr(args, 'path') else '.', args.message)
-            print(output)
-        elif args.action == 'push':
-            output = self.dev.git_push(args.path if hasattr(args, 'path') else '.')
-            print(output)
-    
-    def cmd_brightness(self, args):
-        """Control screen brightness"""
-        if args.action == 'get':
-            level = self.media.get_brightness()
-            print(f"Current brightness: {level}")
-        elif args.action == 'set':
-            if not hasattr(args, 'level'):
-                print("Error: Brightness level required (0-100)")
-                return
-            success = self.media.set_brightness(args.level)
-            print(f"Brightness set to {args.level}%" if success else "Failed to set brightness")
     
     def cmd_kill(self, args):
-        """Kill a process"""
-        if not args.pid:
-            print("Error: PID required")
+        """Kill a process by name"""
+        if not args.process:
+            print("Error: Please provide a process name")
             return
         
-        success = self.process.kill_process(args.pid, args.force)
-        print(f"Process {args.pid} killed" if success else f"Failed to kill process {args.pid}")
+        result = self.process_detector.kill_process_smart(args.process)
+        print(f"\n{result['message']}\n")
+    
+    def cmd_find(self, args):
+        """Find processes by name"""
+        if not args.process:
+            print("Error: Please provide a process name")
+            return
+        
+        matches = self.process_detector.find_process_by_name(args.process)
+        if matches:
+            print(f"\nFound {len(matches)} processes for '{args.process}':")
+            for match in matches:
+                print(f"  • {match['name']} (PID: {match['pid']}, CPU: {match['cpu']}%, RAM: {match['mem']}%)")
+        else:
+            print(f"\nNo processes found for '{args.process}'")
+        print()
+    
+    def cmd_search(self, args):
+        """Search web or Wikipedia"""
+        if not args.query:
+            print("Error: Please provide a search query")
+            return
+        
+        query = ' '.join(args.query)
+        if hasattr(args, 'wikipedia') and args.wikipedia:
+            result = self.search_engine.search_wikipedia(query)
+        else:
+            result = self.search_engine.search_web(query)
+        
+        print(f"\nSearch Results:\n{result}\n")
+    
+    def cmd_news(self, args):
+        """Get latest news"""
+        region = args.region if hasattr(args, 'region') else 'world'
+        query = ' '.join(args.query) if hasattr(args, 'query') and args.query else 'latest news'
+        
+        result = self.search_engine.search_news(query, region)
+        print(f"\nLatest News:\n{result}\n")
+    
+    def cmd_weather(self, args):
+        """Get weather information"""
+        location = ' '.join(args.location) if hasattr(args, 'location') and args.location else None
+        
+        result = self.location_weather.get_weather_summary(location)
+        print(f"\n{result}\n")
+    
+    def cmd_location(self, args):
+        """Get current location information"""
+        # Check if refresh is requested
+        if hasattr(args, 'refresh') and args.refresh:
+            print("🔄 Refreshing location...")
+            location_data = self.location_weather.refresh_location()
+        else:
+            location_data = self.location_weather.get_location()
+        
+        if location_data.get('error'):
+            print(f"\nLocation Error: {location_data['error']}\n")
+        else:
+            print(f"\n📍 Current Location Information:")
+            print(f"City: {location_data.get('city', 'Unknown')}")
+            print(f"Region: {location_data.get('region', 'Unknown')}")
+            print(f"Country: {location_data.get('country', 'Unknown')}")
+            print(f"Timezone: {location_data.get('timezone', 'Unknown')}")
+            print(f"ISP: {location_data.get('isp', 'Unknown')}")
+            print(f"Coordinates: {location_data.get('lat', 0):.4f}, {location_data.get('lon', 0):.4f}")
+            
+            # Show detection method
+            if location_data.get('manual'):
+                print(f"Detection: Manual Override")
+            else:
+                print(f"Detection: Automatic IP-based")
+            print()
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='WavesAI CLI - Quick system control',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  wavesctl status              Show system status
-  wavesctl top                 Show top processes
-  wavesctl top --sort memory   Sort by memory usage
-  wavesctl services --state failed   Show failed services
-  wavesctl network             Show network info
-  wavesctl search myfile       Search for files
-  wavesctl package search vim  Search for package
-  wavesctl package install vim Install package
-  wavesctl git status          Show git status
-  wavesctl brightness get      Get brightness level
-  wavesctl kill 1234           Kill process by PID
-        """
-    )
-    
+    parser = argparse.ArgumentParser(description='WavesAI CLI Tool')
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    # Status
-    subparsers.add_parser('status', help='Show system status')
+    # Status command
+    status_parser = subparsers.add_parser('status', help='Show system status')
     
-    # Top
+    # Top command
     top_parser = subparsers.add_parser('top', help='Show top processes')
-    top_parser.add_argument('--sort', choices=['cpu', 'memory'], default='cpu')
     
-    # Services
-    services_parser = subparsers.add_parser('services', help='List systemd services')
-    services_parser.add_argument('--state', choices=['all', 'active', 'failed'], default='all')
+    # Kill command
+    kill_parser = subparsers.add_parser('kill', help='Kill a process by name')
+    kill_parser.add_argument('process', help='Process name to kill')
     
-    # Network
-    subparsers.add_parser('network', help='Show network information')
+    # Find command
+    find_parser = subparsers.add_parser('find', help='Find processes by name')
+    find_parser.add_argument('process', help='Process name to find')
     
-    # Search
-    search_parser = subparsers.add_parser('search', help='Search for files')
-    search_parser.add_argument('pattern', help='Search pattern')
-    search_parser.add_argument('--directory', '-d', default='.', help='Directory to search in')
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search web or Wikipedia')
+    search_parser.add_argument('query', nargs='+', help='Search query')
+    search_parser.add_argument('-w', '--wikipedia', action='store_true', help='Search Wikipedia instead of web')
     
-    # Package
-    package_parser = subparsers.add_parser('package', help='Package management')
-    package_parser.add_argument('action', choices=['search', 'install', 'remove', 'update', 'clean'])
-    package_parser.add_argument('name', nargs='?', help='Package name')
-    package_parser.add_argument('--yay', action='store_true', help='Use yay instead of pacman')
+    # News command
+    news_parser = subparsers.add_parser('news', help='Get latest news')
+    news_parser.add_argument('query', nargs='*', help='News query (optional)')
+    news_parser.add_argument('-r', '--region', default='world', help='News region (world, usa, uk, india, etc.)')
     
-    # Git
-    git_parser = subparsers.add_parser('git', help='Git operations')
-    git_parser.add_argument('action', choices=['status', 'commit', 'push'])
-    git_parser.add_argument('--path', '-p', default='.', help='Repository path')
-    git_parser.add_argument('--message', '-m', help='Commit message')
+    # Weather command
+    weather_parser = subparsers.add_parser('weather', help='Get weather information')
+    weather_parser.add_argument('location', nargs='*', help='Location (optional, uses current location if not specified)')
     
-    # Brightness
-    brightness_parser = subparsers.add_parser('brightness', help='Control brightness')
-    brightness_parser.add_argument('action', choices=['get', 'set'])
-    brightness_parser.add_argument('level', nargs='?', type=int, help='Brightness level (0-100)')
-    
-    # Kill
-    kill_parser = subparsers.add_parser('kill', help='Kill a process')
-    kill_parser.add_argument('pid', type=int, help='Process ID')
-    kill_parser.add_argument('--force', '-f', action='store_true', help='Force kill')
+    # Location command
+    location_parser = subparsers.add_parser('location', help='Get current location information')
+    location_parser.add_argument('-r', '--refresh', action='store_true', help='Force refresh location detection')
     
     args = parser.parse_args()
     
@@ -249,24 +188,10 @@ Examples:
     cli = WavesAICLI()
     
     # Execute command
-    command_map = {
-        'status': cli.cmd_status,
-        'top': cli.cmd_top,
-        'services': cli.cmd_services,
-        'network': cli.cmd_network,
-        'search': cli.cmd_search,
-        'package': cli.cmd_package,
-        'git': cli.cmd_git,
-        'brightness': cli.cmd_brightness,
-        'kill': cli.cmd_kill
-    }
-    
-    if args.command in command_map:
-        try:
-            command_map[args.command](args)
-        except Exception as e:
-            print(f"Error: {e}")
+    if hasattr(cli, f'cmd_{args.command}'):
+        getattr(cli, f'cmd_{args.command}')(args)
     else:
+        print(f"Unknown command: {args.command}")
         parser.print_help()
 
 if __name__ == "__main__":

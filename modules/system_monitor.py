@@ -9,13 +9,23 @@ import psutil
 import subprocess
 from datetime import datetime
 from typing import Dict, List, Optional
+from .location_weather import LocationWeatherService
 
 
 class SystemMonitor:
     """Handles all system monitoring operations"""
     
     def __init__(self):
-        pass
+        self.location_weather = LocationWeatherService()
+        # Set user's actual location
+        try:
+            import sys
+            import os
+            sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+            from user_location import setup_user_location
+            setup_user_location(self.location_weather)
+        except ImportError:
+            pass  # Use IP geolocation if user_location.py doesn't exist
     
     def get_system_context(self) -> Dict:
         """Gather comprehensive system information for AI context"""
@@ -57,6 +67,9 @@ class SystemMonitor:
             # Get system load
             load_avg = os.getloadavg() if hasattr(os, 'getloadavg') else [0, 0, 0]
             
+            # Get location information
+            location_summary = self.location_weather.get_location_summary()
+            
             return {
                 "username": os.getenv("USER"),
                 "hostname": os.uname().nodename,
@@ -71,7 +84,8 @@ class SystemMonitor:
                 "process_count": process_count,
                 "top_processes": top_processes,
                 "network_stats": network_stats,
-                "load_avg": f"{load_avg[0]:.2f}, {load_avg[1]:.2f}, {load_avg[2]:.2f}"
+                "load_avg": f"{load_avg[0]:.2f}, {load_avg[1]:.2f}, {load_avg[2]:.2f}",
+                "location": location_summary
             }
         except Exception as e:
             return {"error": str(e)}

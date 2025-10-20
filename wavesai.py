@@ -45,7 +45,7 @@ def load_config():
     
     # Fallback to defaults
     return {
-        "model_path": str(Path.home() / ".wavesai/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"),
+        "model_path": str(Path.home() / ".wavesai/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
         "database": str(Path.home() / ".wavesai/config/memory.db"),
         "log_file": str(Path.home() / ".wavesai/config/logs/wavesai.log"),
         "context_length": 4096,
@@ -63,6 +63,7 @@ class WavesAI:
         self.init_database()
         self.llm = None
         self.conversation_history = []
+        self.sudo_password = None  # Store sudo password temporarily
         
         # Initialize modules
         self.search_engine = SearchEngine()
@@ -103,6 +104,69 @@ class WavesAI:
     def search_web(self, query: str) -> str:
         """Wrapper for search_engine.search_web()"""
         return self.search_engine.search_web(query)
+    
+    def search_news(self, query: str = "latest news", region: str = "india") -> str:
+        """Wrapper for search_engine.search_news()"""
+        return self.search_engine.search_news(query, region)
+    
+    def _detect_news_region(self, user_input: str) -> str:
+        """Detect news region from user input - globally aware"""
+        user_input_lower = user_input.lower()
+        
+        # Check for specific countries/regions mentioned
+        country_keywords = {
+            'usa': ['usa', 'america', 'american', 'united states', 'us news'],
+            'uk': ['uk', 'britain', 'british', 'england', 'united kingdom'],
+            'canada': ['canada', 'canadian'],
+            'australia': ['australia', 'australian'],
+            'germany': ['germany', 'german'],
+            'france': ['france', 'french'],
+            'italy': ['italy', 'italian'],
+            'spain': ['spain', 'spanish'],
+            'russia': ['russia', 'russian'],
+            'china': ['china', 'chinese'],
+            'japan': ['japan', 'japanese'],
+            'south korea': ['korea', 'korean', 'south korea'],
+            'india': ['india', 'indian'],
+            'brazil': ['brazil', 'brazilian'],
+            'mexico': ['mexico', 'mexican'],
+            'argentina': ['argentina', 'argentinian'],
+            'south africa': ['south africa', 'south african'],
+            'egypt': ['egypt', 'egyptian'],
+            'nigeria': ['nigeria', 'nigerian'],
+            'thailand': ['thailand', 'thai'],
+            'singapore': ['singapore', 'singaporean'],
+            'malaysia': ['malaysia', 'malaysian'],
+            'indonesia': ['indonesia', 'indonesian'],
+            'philippines': ['philippines', 'filipino'],
+            'vietnam': ['vietnam', 'vietnamese'],
+            'turkey': ['turkey', 'turkish'],
+            'israel': ['israel', 'israeli'],
+            'uae': ['uae', 'emirates', 'dubai'],
+            'saudi arabia': ['saudi', 'saudi arabia']
+        }
+        
+        # Check for country-specific keywords
+        for country, keywords in country_keywords.items():
+            if any(keyword in user_input_lower for keyword in keywords):
+                return country
+        
+        # Check for regional keywords
+        if any(keyword in user_input_lower for keyword in ['world', 'global', 'international']):
+            return 'world'
+        
+        if any(keyword in user_input_lower for keyword in ['local', 'here', 'my area', 'current location']):
+            # Try to get user's location for local news
+            try:
+                location_data = self.system_monitor.location_weather.get_location()
+                if not location_data.get('error'):
+                    return location_data.get('country', 'world')
+            except:
+                pass
+            return 'local'
+        
+        # Default to world news for global audience
+        return 'world'
     
     def smart_execute(self, user_input: str):
         """Wrapper for command_handler.smart_execute()"""
@@ -302,31 +366,39 @@ class WavesAI:
             return {"error": str(e)}
     
     def get_system_alerts(self) -> List[str]:
-        """Check for system alerts and warnings"""
+        """Check for system alerts and warnings with proactive suggestions"""
         alerts = []
         try:
             # Check CPU usage
             cpu_percent = psutil.cpu_percent(interval=1)
-            if cpu_percent > 90:
-                alerts.append(f"⚠️  High CPU usage: {cpu_percent}%")
+            if cpu_percent > 95:
+                alerts.append(f"Sir, CPU usage is critically high at {cpu_percent}%. Would you like me to identify the process?")
+            elif cpu_percent > 85:
+                alerts.append(f"CPU usage is elevated at {cpu_percent}%")
             
             # Check memory usage
             memory = psutil.virtual_memory()
             if memory.percent > 90:
-                alerts.append(f"⚠️  High memory usage: {memory.percent}%")
+                alerts.append(f"Sir, memory usage is at {memory.percent}%. Consider closing some applications.")
+            elif memory.percent > 80:
+                alerts.append(f"Memory usage is high at {memory.percent}%")
             
             # Check disk usage
             disk = psutil.disk_usage('/')
-            if disk.percent > 90:
-                alerts.append(f"⚠️  High disk usage: {disk.percent}%")
+            if disk.percent > 95:
+                alerts.append(f"Sir, disk space is critically low ({disk.percent}% used). Shall I clean up temporary files?")
+            elif disk.percent > 85:
+                alerts.append(f"Disk space is running low ({disk.percent}% used)")
             
             # Check temperature
             try:
                 temps = psutil.sensors_temperatures()
                 if 'coretemp' in temps:
                     cpu_temp = temps['coretemp'][0].current
-                    if cpu_temp > 80:
-                        alerts.append(f"🌡️  High CPU temperature: {cpu_temp}°C")
+                    if cpu_temp > 90:
+                        alerts.append(f"Sir, CPU temperature is critically high at {cpu_temp}°C. Consider checking cooling.")
+                    elif cpu_temp > 80:
+                        alerts.append(f"CPU temperature is elevated at {cpu_temp}°C")
             except:
                 pass
             
@@ -336,8 +408,15 @@ class WavesAI:
                 if proc.info['status'] == psutil.STATUS_ZOMBIE:
                     zombie_count += 1
             
-            if zombie_count > 0:
-                alerts.append(f"🧟 Found {zombie_count} zombie processes")
+            if zombie_count > 5:
+                alerts.append(f"Sir, found {zombie_count} zombie processes. Would you like me to clean them up?")
+            elif zombie_count > 0:
+                alerts.append(f"Found {zombie_count} zombie process(es)")
+            
+            # Check for high swap usage
+            swap = psutil.swap_memory()
+            if swap.percent > 80:
+                alerts.append(f"Swap usage is high at {swap.percent}%. System may be slow.")
             
             return alerts
         except Exception as e:
@@ -436,9 +515,19 @@ class WavesAI:
         
         system_info = self.get_system_context()
         
+        # Check for file writing operations first
+        file_writing_keywords = ['write', 'create', 'generate']
+        file_indicators = [' in ', ' to ', '.txt', '.md', '.py', '.js', '.html', '.css']
+        
+        if (any(keyword in user_input.lower() for keyword in file_writing_keywords) and 
+            any(indicator in user_input.lower() for indicator in file_indicators)):
+            return self._handle_file_writing(user_input)
+        
         # Check if this is a search query and get search results
         search_context = ""
         search_keywords = ['search', 'what is', 'who is', 'how to', 'explain', 'tell me about', 'biography', 'about']
+        news_keywords = ['news', 'headlines', 'breaking', 'latest news', 'current events', 'updates', 'indian news', 'us news', 'uk news', 'world news', 'local news', 'ndtv', 'bbc', 'cnn', 'reuters', 'news today', 'current news', 'breaking news']
+        
         if any(keyword in user_input.lower() for keyword in search_keywords):
             try:
                 # First try Wikipedia for comprehensive information
@@ -456,9 +545,72 @@ class WavesAI:
                     combined_results.append("WEB SEARCH RESULTS:\n" + web_results)
                 
                 if combined_results:
-                    search_context = f"\n\nSEARCH RESULTS FOR CONTEXT:\n" + "\n\n---\n\n".join(combined_results) + "\n\nUse this comprehensive information to provide a conversational response. Synthesize Wikipedia knowledge with current information. Don't just repeat the search results - explain them naturally and conversationally."
+                    search_context = f"\n\nSEARCH RESULTS FOR CONTEXT:\n" + "\n\n---\n\n".join(combined_results) + "\n\nIMPORTANT: Process and refine this information like JARVIS would. Don't just repeat the search results - analyze, synthesize, and present them in a sophisticated, conversational way. Make complex information understandable and engaging. Be naturally helpful and informative."
             except:
                 pass
+        
+        elif any(keyword in user_input.lower() for keyword in news_keywords):
+            try:
+                # Handle news queries with AI processing
+                region = self._detect_news_region(user_input)
+                news_results = self.search_news(user_input, region)
+                
+                # AI should ALWAYS process and refine the results
+                search_context = f"\n\nNEWS SEARCH RESULTS:\n{news_results}\n\nIMPORTANT: You must process these search results and provide a conversational, JARVIS-like response. Do not just repeat the raw results. Instead:\n1. Analyze what information is available\n2. Summarize it in a natural, conversational way\n3. Be helpful and engaging like JARVIS\n4. If results are limited, acknowledge this conversationally and suggest alternatives\n5. Always maintain your sophisticated, friendly personality"
+            except Exception as e:
+                search_context = f"\n\nNews search failed. Respond conversationally like JARVIS, acknowledging the limitation and suggesting alternatives like visiting news websites directly."
+        
+        # Check for weather and location queries
+        weather_keywords = ['weather', 'temperature', 'climate', 'forecast', 'rain', 'sunny', 'cloudy', 'hot', 'cold', 'warm']
+        location_keywords = ['location', 'where am i', 'my location', 'current location', 'where i am']
+        
+        if (any(keyword in user_input.lower() for keyword in weather_keywords) or 
+            any(keyword in user_input.lower() for keyword in location_keywords)):
+            try:
+                # For location queries, provide location info
+                if any(keyword in user_input.lower() for keyword in location_keywords):
+                    location_data = self.system_monitor.location_weather.get_location()
+                    if not location_data.get('error'):
+                        city = location_data.get('city', 'Unknown')
+                        region = location_data.get('region', '')
+                        country = location_data.get('country', 'Unknown')
+                        location_str = f"{city}"
+                        if region and region != city:
+                            location_str += f", {region}"
+                        location_str += f", {country}"
+                        
+                        search_context = f"\n\nLOCATION INFORMATION:\nCurrent Location: {location_str}\nTimezone: {location_data.get('timezone', 'Unknown')}\n\nIMPORTANT: Process this location data and respond conversationally like JARVIS. Be sophisticated, friendly, and natural. Don't just state the raw data - present it in an engaging, helpful way."
+                
+                # For weather queries, provide weather info
+                if any(keyword in user_input.lower() for keyword in weather_keywords):
+                    # Extract location from query if specified
+                    location = None
+                    if " in " in user_input.lower():
+                        location_part = user_input.lower().split(" in ")[-1].strip()
+                        location = location_part
+                    elif " at " in user_input.lower():
+                        location_part = user_input.lower().split(" at ")[-1].strip()
+                        location = location_part
+                    elif "here" in user_input.lower() or "my location" in user_input.lower():
+                        # Use current location
+                        location = None
+                    
+                    # Get weather information
+                    weather_results = self.system_monitor.location_weather.get_weather_summary(location)
+                    
+                    if weather_results and not ("error" in weather_results.lower()):
+                        search_context = f"\n\nWEATHER INFORMATION:\n{weather_results}\n\nIMPORTANT: Process this weather data and respond conversationally like JARVIS. Don't just repeat the raw data - analyze it and present it in a sophisticated, engaging way. Comment on the conditions, temperature, and any relevant details. Be helpful and natural."
+            except Exception as e:
+                # Fallback: at least provide location
+                try:
+                    location_data = self.system_monitor.location_weather.get_location()
+                    if not location_data.get('error'):
+                        city = location_data.get('city', 'Unknown')
+                        region = location_data.get('region', '')
+                        country = location_data.get('country', 'Unknown')
+                        search_context = f"\n\nCURRENT LOCATION: {city}, {region}, {country}\n\nUse this location information in your response."
+                except:
+                    pass
         
         # Format system status for the prompt
         system_status = f"""- User: {system_info['username']}@{system_info['hostname']}
@@ -466,7 +618,8 @@ class WavesAI:
 - RAM: {system_info['ram_usage']}
 - {system_info['gpu_info']}
 - Uptime: {system_info['uptime']}
-- Time: {system_info['current_time']}"""
+- Time: {system_info['current_time']}
+- {system_info.get('location', 'Location: Unknown')}"""
         
         # Load system prompt from file and inject system status
         system_prompt = self.system_prompt_template.replace("{system_status}", system_status)
@@ -492,6 +645,97 @@ class WavesAI:
         except Exception as e:
             return f"Error: {e}"
     
+    def _handle_file_writing(self, response: str):
+        """Handle file writing operations smoothly"""
+        try:
+            # Extract file path and content
+            lines = response.split('\n')
+            file_path = None
+            content_lines = []
+            in_content = False
+            
+            for line in lines:
+                if line.startswith("WRITE_TO_FILE:"):
+                    file_path = line.replace("WRITE_TO_FILE:", "").strip()
+                elif line.startswith("CONTENT_START"):
+                    in_content = True
+                elif line.startswith("CONTENT_END"):
+                    in_content = False
+                elif in_content:
+                    content_lines.append(line)
+            
+            if not file_path:
+                print(f"\033[1;31m[Error]\033[0m No file path specified")
+                return
+            
+            # Expand home directory
+            if file_path.startswith("~/"):
+                file_path = os.path.expanduser(file_path)
+            
+            # Write content to file
+            content = '\n'.join(content_lines)
+            
+            print(f"\033[1;35m[WavesAI]\033[0m ➜ Writing {len(content)} characters to {file_path}")
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            print(f"\033[1;32m[Success]\033[0m File written successfully: {file_path}")
+            print(f"\033[1;36m[Info]\033[0m Content length: {len(content)} characters, {len(content_lines)} lines")
+            
+        except Exception as e:
+            print(f"\033[1;31m[Error]\033[0m Failed to write file: {e}")
+    
+    def _handle_file_operations(self, user_input: str) -> Optional[str]:
+        """Handle common file operations with smart detection"""
+        lower_input = user_input.lower()
+        
+        # Read file operations
+        read_patterns = ['read', 'show', 'display', 'cat', 'view', 'open and show']
+        if any(pattern in lower_input for pattern in read_patterns) and ('file' in lower_input or '.txt' in lower_input or '.py' in lower_input or '.json' in lower_input):
+            # Extract file path
+            for word in user_input.split():
+                if '/' in word or '.' in word:
+                    file_path = word.strip('.,;:')
+                    if file_path.startswith('~/'):
+                        file_path = os.path.expanduser(file_path)
+                    
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                            
+                            # Show file info
+                            lines = len(content.split('\n'))
+                            chars = len(content)
+                            
+                            print(f"\033[1;36m[File Info]\033[0m {file_path}")
+                            print(f"\033[1;36m[Size]\033[0m {chars} characters, {lines} lines")
+                            print(f"\033[1;32m[Content]\033[0m\n{content}")
+                            return f"File '{file_path}' displayed successfully"
+                        except Exception as e:
+                            return f"Error reading file: {e}"
+                    else:
+                        return f"File not found: {file_path}"
+        
+        # List files operations
+        if 'list files' in lower_input or 'show files' in lower_input:
+            # Extract directory path or use current
+            directory = '.'
+            if ' in ' in lower_input:
+                dir_part = lower_input.split(' in ')[-1].strip()
+                directory = dir_part if dir_part else '.'
+            
+            if directory.startswith('~/'):
+                directory = os.path.expanduser(directory)
+            
+            return None  # Let it fall through to execute ls command
+        
+        return None
+
     def is_safe_command(self, command: str) -> bool:
         """Check if command is safe to auto-execute"""
         safe_commands = [
@@ -1233,6 +1477,96 @@ How may I assist you?
         monitor_thread.start()
         return monitor_thread
     
+    def setup_sudo_access(self):
+        """Setup sudo access with user confirmation - JARVIS style"""
+        print("\n\033[1;35m[WavesAI]\033[0m ➜ Sir, some operations may require elevated privileges.")
+        print("\033[1;36m[Info]\033[0m I can temporarily store your sudo password for seamless operation.")
+        print("\033[1;36m[Info]\033[0m The password will only be kept in memory during this session.")
+        
+        confirm = input("\n\033[1;33m[Confirm?]\033[0m Would you like to enable sudo access? (yes/no): ").strip().lower()
+        
+        if confirm in ['yes', 'y', 'confirm']:
+            import getpass
+            password = getpass.getpass("\033[1;32m[Sudo Password]\033[0m ➜ ")
+            
+            # Verify the password works
+            print("\n\033[1;35m[WavesAI]\033[0m ➜ Verifying credentials...", end='\r')
+            test_command = f"echo '{password}' | sudo -S echo 'verified' 2>/dev/null"
+            result = subprocess.run(test_command, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0 and 'verified' in result.stdout:
+                self.sudo_password = password
+                print("\033[1;35m[WavesAI]\033[0m ➜ Sudo access confirmed. I'll handle privileged operations seamlessly, sir.    ")
+                return True
+            else:
+                print("\033[1;35m[WavesAI]\033[0m ➜ I'm afraid that password didn't work, sir. Continuing without sudo access.    ")
+                return False
+        else:
+            print("\n\033[1;35m[WavesAI]\033[0m ➜ Understood, sir. I'll request sudo access when needed.")
+            return False
+    
+    def execute_with_sudo(self, command: str) -> Dict:
+        """Execute command with sudo using stored password"""
+        if self.sudo_password:
+            # Use stored password
+            sudo_command = f"echo '{self.sudo_password}' | sudo -S {command}"
+            try:
+                result = subprocess.run(
+                    sudo_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                # Clean up sudo password prompt from output
+                stdout = result.stdout
+                stderr = result.stderr
+                if '[sudo]' in stderr:
+                    stderr = '\n'.join([line for line in stderr.split('\n') if '[sudo]' not in line])
+                
+                if result.returncode == 0:
+                    return {
+                        "success": True,
+                        "output": stdout,
+                        "error": ""
+                    }
+                else:
+                    # Analyze error
+                    from modules.error_analyzer import get_error_analyzer
+                    error_analyzer = get_error_analyzer()
+                    error_analysis = error_analyzer.analyze_error(stderr, command)
+                    
+                    return {
+                        "success": False,
+                        "output": stdout,
+                        "error": stderr,
+                        "error_analysis": error_analysis
+                    }
+            except subprocess.TimeoutExpired:
+                return {
+                    "success": False,
+                    "error": "Command timed out",
+                    "error_analysis": {
+                        "summary": "Command timeout",
+                        "solution": "The command took too long. It may require user input or be stuck.",
+                        "category": "timeout"
+                    }
+                }
+            except Exception as e:
+                from modules.error_analyzer import get_error_analyzer
+                error_analyzer = get_error_analyzer()
+                error_analysis = error_analyzer.analyze_error(str(e), command)
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "error_analysis": error_analysis
+                }
+        else:
+            # No stored password, ask user
+            print(f"\n\033[1;35m[WavesAI]\033[0m ➜ This operation requires sudo privileges, sir.")
+            return self.command_handler.execute_command(f"sudo {command}")
+    
     def interactive_mode(self):
         """Main interactive loop"""
         if not self.load_llm():
@@ -1241,6 +1575,9 @@ How may I assist you?
         # Start background monitoring
         self.start_monitoring_thread()
         self.startup_briefing()
+        
+        # Setup sudo access
+        self.setup_sudo_access()
         
         while True:
             try:
@@ -1266,7 +1603,13 @@ How may I assist you?
                     print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Let me look that up for you, sir.")
                     # Continue to AI processing below
                 
-                # Try smart_execute first for direct commands
+                # Try file operations first
+                file_response = self._handle_file_operations(user_input)
+                if file_response:
+                    print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {file_response}")
+                    continue
+                
+                # Try smart_execute for direct commands
                 smart_response = self.smart_execute(user_input)
                 if smart_response:
                     print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {smart_response}")
@@ -1278,8 +1621,13 @@ How may I assist you?
                 # Validate response to prevent hallucinations
                 response = self.validate_response(user_input, response)
                 
+                # Check if AI wants to write to a file
+                if "WRITE_TO_FILE:" in response:
+                    self._handle_file_writing(response)
+                    continue
+                
                 # Check if AI wants to execute a command
-                if "EXECUTE_COMMAND:" in response:
+                elif "EXECUTE_COMMAND:" in response:
                     command = response.split("EXECUTE_COMMAND:")[1].strip().split()[0] if " " in response.split("EXECUTE_COMMAND:")[1] else response.split("EXECUTE_COMMAND:")[1].strip()
                     # Extract full command line
                     cmd_start = response.find("EXECUTE_COMMAND:") + 16
@@ -1296,8 +1644,14 @@ How may I assist you?
                             print("\n\033[1;33m[Cancelled]\033[0m Command not executed.")
                             continue
                     
-                    # Execute the command
-                    result = self.execute_command(command)
+                    # Check if command requires sudo
+                    if command.startswith('sudo '):
+                        # Remove 'sudo' from command and use our sudo handler
+                        actual_command = command[5:].strip()
+                        result = self.execute_with_sudo(actual_command)
+                    else:
+                        # Execute normally
+                        result = self.execute_command(command)
                     if result['success']:
                         if result['output']:
                             print(f"\n\033[1;32m[Output]\033[0m\n{result['output']}")
@@ -1308,10 +1662,32 @@ How may I assist you?
                                 summary_prompt = f"The user asked: '{user_input}'\nCommand executed: {command}\nOutput:\n{result['output']}\n\nProvide a brief, conversational summary of this information like JARVIS would."
                                 summary = self.generate_response(summary_prompt)
                                 print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {summary}")
-                        else:
-                            print(f"\n\033[1;32m[Success]\033[0m Done, sir.")
                     else:
-                        print(f"\n\033[1;31m[Error]\033[0m {result['error']}")
+                        # Pass error through LLM for conversational response
+                        if 'error_analysis' in result:
+                            analysis = result['error_analysis']
+                            error_prompt = f"""The user tried to execute: {command}
+The command failed with this error:
+
+Error Type: {analysis['summary']}
+Error Details: {analysis.get('original_error', result.get('error', 'Unknown error'))}
+Recommended Solution: {analysis['solution']}
+
+Explain this error to the user conversationally like JARVIS would. Be brief (2-3 sentences), explain what went wrong, and tell them how to fix it. Address them as 'sir' if appropriate."""
+                            
+                            print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Analyzing error...", end='\r')
+                            conversational_response = self.generate_response(error_prompt)
+                            print(f"\033[1;35m[WavesAI]\033[0m ➜ {conversational_response}                    ")
+                        else:
+                            # Fallback for errors without analysis
+                            error_prompt = f"""The user tried to execute: {command}
+The command failed with this error: {result.get('error', 'Unknown error')}
+
+Explain this error to the user conversationally like JARVIS would. Be brief (2-3 sentences), explain what went wrong, and suggest how to fix it. Address them as 'sir' if appropriate."""
+                            
+                            print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Analyzing error...", end='\r')
+                            conversational_response = self.generate_response(error_prompt)
+                            print(f"\033[1;35m[WavesAI]\033[0m ➜ {conversational_response}                    ")
                     
                     self.save_interaction(user_input, f"Executed: {command}", command)
                     continue
@@ -1334,7 +1710,31 @@ How may I assist you?
                                 else:
                                     print(f"\n\033[1;32m[Success]\033[0m Command executed successfully")
                             else:
-                                print(f"\n\033[1;31m[Error]\033[0m {result['error']}")
+                                # Pass error through LLM for conversational response
+                                if 'error_analysis' in result:
+                                    analysis = result['error_analysis']
+                                    error_prompt = f"""The user tried to execute: {command}
+The command failed with this error:
+
+Error Type: {analysis['summary']}
+Error Details: {analysis.get('original_error', result.get('error', 'Unknown error'))}
+Recommended Solution: {analysis['solution']}
+
+Explain this error to the user conversationally like JARVIS would. Be brief (2-3 sentences), explain what went wrong, and tell them how to fix it. Address them as 'sir' if appropriate."""
+                                    
+                                    print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Analyzing error...", end='\r')
+                                    conversational_response = self.generate_response(error_prompt)
+                                    print(f"\033[1;35m[WavesAI]\033[0m ➜ {conversational_response}                    ")
+                                else:
+                                    # Fallback for errors without analysis
+                                    error_prompt = f"""The user tried to execute: {command}
+The command failed with this error: {result.get('error', 'Unknown error')}
+
+Explain this error to the user conversationally like JARVIS would. Be brief (2-3 sentences), explain what went wrong, and suggest how to fix it. Address them as 'sir' if appropriate."""
+                                    
+                                    print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Analyzing error...", end='\r')
+                                    conversational_response = self.generate_response(error_prompt)
+                                    print(f"\033[1;35m[WavesAI]\033[0m ➜ {conversational_response}                    ")
                             
                             self.save_interaction(user_input, response, command)
                         else:

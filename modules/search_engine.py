@@ -48,98 +48,63 @@ class SearchEngine:
                     coords = data['coordinates']
                     result_parts.append(f"**Location:** {coords.get('lat', 'N/A')}°N, {coords.get('lon', 'N/A')}°E")
                 
-                # Get page URL
-                if data.get('content_urls', {}).get('desktop', {}).get('page'):
-                    page_url = data['content_urls']['desktop']['page']
-                    result_parts.append(f"*Source: [Wikipedia]({page_url})*")
-                
                 if result_parts:
                     return "\n\n".join(result_parts)
             
-            # If direct page doesn't exist, try search
-            return self.search_wikipedia_articles(query)
-            
-        except Exception as e:
-            return f"Wikipedia search failed: {str(e)}"
-    
-    def search_wikipedia_articles(self, query: str) -> str:
-        """Search for Wikipedia articles when direct page doesn't exist"""
-        try:
-            # Wikipedia search API
-            search_url = "https://en.wikipedia.org/w/api.php"
-            params = {
+            # If direct search fails, try search API
+            search_api_url = "https://en.wikipedia.org/w/api.php"
+            search_params = {
                 'action': 'query',
                 'format': 'json',
                 'list': 'search',
                 'srsearch': query,
-                'srlimit': 3,
-                'srprop': 'snippet|size'
+                'srlimit': 3
             }
             
-            headers = {'User-Agent': self.user_agent}
-            response = requests.get(search_url, params=params, headers=headers, timeout=10)
+            search_response = requests.get(search_api_url, params=search_params, headers=headers, timeout=10)
             
-            if response.status_code == 200:
-                data = response.json()
-                results = []
-                
-                if data.get('query', {}).get('search'):
-                    for article in data['query']['search'][:3]:
-                        title = article.get('title', '')
-                        snippet = article.get('snippet', '')
-                        
-                        # Clean up HTML entities in snippet
+            if search_response.status_code == 200:
+                search_data = search_response.json()
+                if search_data.get('query', {}).get('search'):
+                    results = []
+                    for result in search_data['query']['search'][:3]:
+                        title = result.get('title', '')
+                        snippet = result.get('snippet', '')
+                        # Clean HTML tags from snippet
+                        snippet = re.sub(r'<[^>]+>', '', snippet)
                         snippet = unescape(snippet)
-                        snippet = snippet.replace('<span class="searchmatch">', '').replace('</span>', '')
                         
                         if title and snippet:
                             results.append(f"**{title}**\n{snippet}")
-                
-                if results:
-                    return "**Wikipedia Search Results:**\n\n" + "\n\n".join(results)
+                    
+                    if results:
+                        return "**Wikipedia Search Results:**\n\n" + "\n\n".join(results)
             
             return "No Wikipedia articles found for that query."
             
         except Exception as e:
             return f"Wikipedia search failed: {str(e)}"
     
-    def get_wikipedia_content(self, title: str) -> str:
-        """Get full Wikipedia article content"""
+    def search_news(self, query: str = "latest news", region: str = "world") -> str:
+        """Simple news search using web search"""
         try:
-            # Get page content
-            content_url = f"https://en.wikipedia.org/api/rest_v1/page/html/{title.replace(' ', '_')}"
-            headers = {'User-Agent': self.user_agent}
-            response = requests.get(content_url, headers=headers, timeout=15)
+            # Simple news query construction
+            if region.lower() == "world":
+                news_query = f"latest world news today"
+            else:
+                news_query = f"latest {region} news today"
             
-            if response.status_code == 200:
-                content = response.text
-                
-                # Extract main content (simplified parsing)
-                # Remove HTML tags but keep structure
-                content = re.sub(r'<[^>]+>', ' ', content)
-                content = re.sub(r'\s+', ' ', content).strip()
-                content = unescape(content)
-                
-                # Get first few paragraphs (approximately 1000 characters)
-                paragraphs = content.split('.')
-                summary = ""
-                for para in paragraphs:
-                    if len(summary + para) < 1000:
-                        summary += para + "."
-                    else:
-                        break
-                
-                return summary.strip() if summary else content[:1000] + "..."
-            
-            return "Could not retrieve Wikipedia content."
+            # Just do a simple web search
+            return self.search_web(news_query)
             
         except Exception as e:
-            return f"Wikipedia content retrieval failed: {str(e)}"
+            return f"Unable to fetch news at the moment. Please try again later."
+    
     
     def search_web(self, query: str) -> str:
         """Enhanced web search using DuckDuckGo's full potential"""
         try:
-            # Try DuckDuckGo Instant Answer API first with enhanced parameters
+            # Try DuckDuckGo Instant Answer API first
             api_url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1&t=wavesai"
             api_response = requests.get(api_url, timeout=10)
             api_data = api_response.json()
@@ -150,7 +115,7 @@ class SearchEngine:
             if api_data.get('AbstractText'):
                 abstract = api_data['AbstractText']
                 abstract_source = api_data.get('AbstractSource', 'Wikipedia')
-                result_parts.append(f"**{api_data.get('Abstract', 'Information')}:**\n{abstract}\n*Source: {abstract_source}*")
+                result_parts.append(f"**Information:**\n{abstract}\n*Source: {abstract_source}*")
             
             # Get definition if available
             if api_data.get('Definition'):
@@ -169,115 +134,35 @@ class SearchEngine:
                 if related_info:
                     result_parts.append("**Related Information:**\n" + '\n'.join(related_info))
             
-            # Get definitions from definitions array
-            if api_data.get('Definitions'):
-                definitions = []
-                for def_item in api_data['Definitions'][:3]:
-                    if isinstance(def_item, dict) and 'Definition' in def_item:
-                        definitions.append(f"• {def_item['Definition']}")
-                if definitions:
-                    result_parts.append("**Definitions:**\n" + '\n'.join(definitions))
-            
-            # Get infobox data for biographical information
-            if api_data.get('Infobox'):
-                infobox = api_data['Infobox']
-                if isinstance(infobox, dict):
-                    infobox_info = []
-                    for key, value in infobox.items():
-                        if isinstance(value, str) and len(value) > 5:
-                            infobox_info.append(f"• **{key.replace('_', ' ').title()}:** {value}")
-                    if infobox_info:
-                        result_parts.append("**Key Details:**\n" + '\n'.join(infobox_info[:8]))
-            
             # If we have good results from API, return them
             if result_parts:
                 return "\n\n".join(result_parts)
             
-            # If API doesn't have enough info, try HTML search
-            html_result = self.search_web_html(query)
-            
-            # If HTML search also fails, try to provide some basic info
-            if ("couldn't extract" in html_result.lower() or 
-                "couldn't find" in html_result.lower() or
-                "no results were found" in html_result.lower()):
-                
-                # Try one more fallback: return basic API info even if minimal
-                if api_data.get('AbstractText') or api_data.get('RelatedTopics'):
-                    fallback_parts = []
-                    if api_data.get('AbstractText'):
-                        fallback_parts.append(f"**Basic Information:** {api_data['AbstractText']}")
-                    if api_data.get('RelatedTopics'):
-                        related = []
-                        for topic in api_data['RelatedTopics'][:2]:
-                            if isinstance(topic, dict) and 'Text' in topic:
-                                related.append(f"• {topic['Text']}")
-                        if related:
-                            fallback_parts.append("**Related:**\n" + '\n'.join(related))
-                    
-                    if fallback_parts:
-                        return "\n\n".join(fallback_parts) + "\n\n*Note: Limited information available.*"
-            
-            return html_result
+            # If no API results, provide helpful fallback
+            return self.search_web_fallback(query)
             
         except Exception as e:
-            return f"Search failed: {str(e)}. Please try again or check your internet connection, sir."
+            return f"Search failed: {str(e)}"
     
-    def search_web_html(self, query: str) -> str:
-        """Enhanced HTML search using DuckDuckGo for comprehensive results"""
-        try:
-            search_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
-            headers = {'User-Agent': self.browser_agent}
-            
-            response = requests.get(search_url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                content = response.text
-                results = []
-                
-                # Try DuckDuckGo's current HTML structure patterns
-                result_patterns = [
-                    r'<div class="result"[^>]*>(.*?)</div>',
-                    r'<div class="web-result"[^>]*>(.*?)</div>',
-                    r'<div class="result__body"[^>]*>(.*?)</div>',
-                    r'<article[^>]*>(.*?)</article>',
-                    r'<div class="result__snippet"[^>]*>(.*?)</div>'
-                ]
-                
-                for pattern in result_patterns:
-                    result_blocks = re.findall(pattern, content, re.DOTALL)
-                    if result_blocks:
-                        for block in result_blocks[:5]:
-                            # Extract title
-                            title_match = re.search(r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>', block)
-                            title = title_match.group(1) if title_match else ""
-                            title = re.sub(r'<[^>]+>', '', title).strip()
-                            
-                            # Extract snippet
-                            snippet_match = re.search(r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>', block)
-                            if not snippet_match:
-                                snippet_match = re.search(r'class="[^"]*snippet[^"]*"[^>]*>(.*?)</div>', block)
-                            snippet = snippet_match.group(1) if snippet_match else ""
-                            snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-                            snippet = unescape(snippet)
-                            
-                            if title and snippet:
-                                results.append(f"**{title}**\n{snippet}")
-                        
-                        if results:
-                            break
-                
-                if results:
-                    return "**Web Search Results:**\n\n" + "\n\n".join(results[:5])
-                else:
-                    return "Couldn't extract search results. The search page structure may have changed."
-            
-            return "Couldn't find any results for that query."
-            
-        except Exception as e:
-            return f"HTML search failed: {str(e)}"
-    
-    def combined_search(self, query: str) -> tuple:
-        """Perform both Wikipedia and web search, return both results"""
-        wiki_results = self.search_wikipedia(query)
-        web_results = self.search_web(query)
-        return wiki_results, web_results
+    def search_web_fallback(self, query: str) -> str:
+        """Provide helpful fallback when web search fails"""
+        # For news queries, provide simple response
+        if any(keyword in query.lower() for keyword in ['news', 'latest', 'breaking', 'current']):
+            return "Unable to fetch live news at the moment. Please visit news websites like BBC, Reuters, or CNN for the latest updates."
+        
+        # For other queries, provide helpful alternatives
+        return f"""**Web Search Information**
+
+I'm currently unable to fetch live web results due to technical limitations.
+
+**Suggested alternatives for '{query}':**
+• Use your browser: `open firefox` then search for "{query}"
+• Try Wikipedia search for factual information
+• Use specific commands like `weather` for weather info
+• Ask me to open relevant websites
+
+**Quick commands:**
+• `open firefox` - Open web browser
+• `weather [location]` - Get weather info
+
+Would you like me to help you with any of these alternatives?"""

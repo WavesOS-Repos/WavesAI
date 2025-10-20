@@ -3,7 +3,7 @@
   "_comment2": "Optimized for Intel i5 12th Gen + RTX 3050 8GB + 16GB RAM",
   
   "model": {
-    "path": "~/.wavesai/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+    "path": "~/.wavesai/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
     "context_length": 8192,
     "gpu_layers": 33,
     "threads": 8,
@@ -18,7 +18,7 @@
     "top_p": 0.9,
     "top_k": 40,
     "repeat_penalty": 1.15,
-    "max_tokens": 512,
+    "max_tokens": 4096,
     "stop_sequences": ["<|eot_id|>", "<|end_of_text|>", "User:", "[You]"]
   },
   
