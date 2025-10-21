@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """
-WavesAI CLI - Quick command interface
+WavesAI CLI - Complete command interface
 Usage: wavesctl <command> [args]
+
+This script automatically activates the virtual environment and provides
+both quick CLI commands and interactive mode access.
 """
 
 import sys
 import os
 import argparse
+import subprocess
 from pathlib import Path
 
 # Add WavesAI directory to path
 wavesai_dir = Path.home() / ".wavesai"
+venv_dir = wavesai_dir / "venv"
 sys.path.insert(0, str(wavesai_dir))
+
+# Activate virtual environment if not already activated
+if not hasattr(sys, 'real_prefix') and not (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
+    # Not in a virtual environment, activate it
+    activate_script = venv_dir / "bin" / "activate_this.py"
+    if activate_script.exists():
+        exec(open(activate_script).read(), {'__file__': str(activate_script)})
+    else:
+        # Fallback: modify sys.path to use venv packages
+        site_packages = venv_dir / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+        if site_packages.exists():
+            sys.path.insert(0, str(site_packages))
 
 from modules.system_monitor import SystemMonitor
 from modules.command_handler import CommandHandler
@@ -142,10 +159,108 @@ class WavesAICLI:
             else:
                 print(f"Detection: Automatic IP-based")
             print()
+    
+    def cmd_start(self, args):
+        """Start WavesAI interactive mode"""
+        wavesai_script = wavesai_dir / "wavesai.py"
+        
+        if not wavesai_script.exists():
+            print("❌ Error: wavesai.py not found")
+            print(f"Expected location: {wavesai_script}")
+            return
+        
+        # Run wavesai.py using the venv python
+        venv_python = venv_dir / "bin" / "python"
+        if venv_python.exists():
+            os.execv(str(venv_python), [str(venv_python), str(wavesai_script)])
+        else:
+            # Fallback to system python
+            os.execv(sys.executable, [sys.executable, str(wavesai_script)])
+    
+    def cmd_run(self, args):
+        """Alias for start command"""
+        self.cmd_start(args)
+    
+    def cmd_version(self, args):
+        """Show version information"""
+        print("\n\033[0;35m╔══════════════════════════════════════════════════════════╗\033[0m")
+        print("\033[0;35m║              WavesAI Version 3.1                         ║\033[0m")
+        print("\033[0;35m╚══════════════════════════════════════════════════════════╝\033[0m")
+        print("\n🤖 JARVIS-like AI Assistant for Linux")
+        print(f"📁 Installation: {wavesai_dir}")
+        print(f"🐍 Python: {sys.version.split()[0]}")
+        print(f"📦 Virtual Environment: {venv_dir}")
+        print("\n✨ Features:")
+        print("  • JARVIS-like conversational AI")
+        print("  • System monitoring and control")
+        print("  • 170+ advanced system commands")
+        print("  • Intelligent error handling")
+        print("  • Dangerous operation protection")
+        print("  • Sudo password management")
+        print()
+    
+    def cmd_config(self, args):
+        """Edit configuration file"""
+        config_file = wavesai_dir / "config" / "config.json"
+        
+        if not config_file.exists():
+            print("⚠️  Configuration file not found. Creating default...")
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            config_file.write_text('{}')
+        
+        # Try to open with user's preferred editor
+        editor = os.environ.get('EDITOR', 'nano')
+        try:
+            subprocess.run([editor, str(config_file)])
+        except Exception as e:
+            print(f"❌ Error opening editor: {e}")
+            print(f"📁 Config file location: {config_file}")
+    
+    def cmd_logs(self, args):
+        """View WavesAI logs"""
+        log_file = wavesai_dir / "config" / "logs" / "wavesai.log"
+        
+        if not log_file.exists():
+            print("⚠️  No logs found")
+            print(f"📁 Log file will be created at: {log_file}")
+            return
+        
+        # Tail the log file
+        try:
+            subprocess.run(['tail', '-f', str(log_file)])
+        except KeyboardInterrupt:
+            print("\n✓ Stopped viewing logs")
+        except Exception as e:
+            print(f"❌ Error viewing logs: {e}")
+            print(f"📁 Log file location: {log_file}")
 
 def main():
-    parser = argparse.ArgumentParser(description='WavesAI CLI Tool')
+    parser = argparse.ArgumentParser(
+        description='WavesAI CLI Tool - JARVIS-like AI Assistant',
+        epilog='Examples:\n'
+               '  wavesctl start              # Start interactive mode\n'
+               '  wavesctl status             # Show system status\n'
+               '  wavesctl top                # Show top processes\n'
+               '  wavesctl weather Mumbai     # Get weather\n'
+               '  wavesctl search "AI"        # Search web\n',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Start command (default)
+    start_parser = subparsers.add_parser('start', help='Start WavesAI interactive mode (default)')
+    
+    # Run command (alias for start)
+    run_parser = subparsers.add_parser('run', help='Start WavesAI interactive mode (alias for start)')
+    
+    # Version command
+    version_parser = subparsers.add_parser('version', help='Show version information')
+    
+    # Config command
+    config_parser = subparsers.add_parser('config', help='Edit configuration file')
+    
+    # Logs command
+    logs_parser = subparsers.add_parser('logs', help='View WavesAI logs')
     
     # Status command
     status_parser = subparsers.add_parser('status', help='Show system status')
@@ -181,9 +296,9 @@ def main():
     
     args = parser.parse_args()
     
+    # Default to 'start' if no command provided
     if not args.command:
-        parser.print_help()
-        return
+        args.command = 'start'
     
     cli = WavesAICLI()
     
@@ -191,7 +306,7 @@ def main():
     if hasattr(cli, f'cmd_{args.command}'):
         getattr(cli, f'cmd_{args.command}')(args)
     else:
-        print(f"Unknown command: {args.command}")
+        print(f"❌ Unknown command: {args.command}")
         parser.print_help()
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ def load_config():
         "gpu_layers": 35,
         "threads": 8,
         "temperature": 0.7,
-        "max_tokens": 512
+        "max_tokens": 1024  # Increased from 512 for longer, complete responses
     }
 
 CONFIG = load_config()
@@ -64,6 +64,8 @@ class WavesAI:
         self.llm = None
         self.conversation_history = []
         self.sudo_password = None  # Store sudo password temporarily
+        self.pending_dangerous_command = None  # Store dangerous command awaiting confirmation
+        self.confirmation_code = None  # Store current confirmation code
         
         # Initialize modules
         self.search_engine = SearchEngine()
@@ -72,6 +74,15 @@ class WavesAI:
         
         self.system_context = self.system_monitor.get_system_context()
         self.system_prompt_template = self.load_system_prompt()
+        
+        # Define dangerous command patterns
+        self.dangerous_patterns = [
+            'rm -rf', 'mkfs', 'dd if=', 'shred', 'wipe', 
+            'fdisk', 'parted', 'lvremove', 'vgremove',
+            'mdadm --zero-superblock', 'iptables -F',
+            'systemctl isolate', 'reboot', 'shutdown', 
+            'poweroff', 'halt'
+        ]
     
     def get_system_context(self):
         """Wrapper for system_monitor.get_system_context()"""
@@ -523,42 +534,88 @@ class WavesAI:
             any(indicator in user_input.lower() for indicator in file_indicators)):
             return self._handle_file_writing(user_input)
         
-        # Check if this is a search query and get search results
+        # Check if this is an information query - ALWAYS search the internet for facts
         search_context = ""
-        search_keywords = ['search', 'what is', 'who is', 'how to', 'explain', 'tell me about', 'biography', 'about']
+        
+        # Keywords that indicate the user wants information (not system commands)
+        info_keywords = ['what', 'who', 'when', 'where', 'why', 'how', 'tell me', 'explain', 'about', 'is', 'are', 'was', 'were', 'define', 'meaning', 'search']
         news_keywords = ['news', 'headlines', 'breaking', 'latest news', 'current events', 'updates', 'indian news', 'us news', 'uk news', 'world news', 'local news', 'ndtv', 'bbc', 'cnn', 'reuters', 'news today', 'current news', 'breaking news']
         
-        if any(keyword in user_input.lower() for keyword in search_keywords):
-            try:
-                # First try Wikipedia for comprehensive information
-                wiki_results = self.search_wikipedia(user_input)
-                
-                # Also get web search results for current/recent information
-                web_results = self.search_web(user_input)
-                
-                # Combine results intelligently
-                combined_results = []
-                if wiki_results and not ("failed" in wiki_results.lower() or "not found" in wiki_results.lower()):
-                    combined_results.append("WIKIPEDIA KNOWLEDGE:\n" + wiki_results)
-                
-                if web_results and not ("couldn't find" in web_results.lower() or "no results" in web_results.lower()):
-                    combined_results.append("WEB SEARCH RESULTS:\n" + web_results)
-                
-                if combined_results:
-                    search_context = f"\n\nSEARCH RESULTS FOR CONTEXT:\n" + "\n\n---\n\n".join(combined_results) + "\n\nIMPORTANT: Process and refine this information like JARVIS would. Don't just repeat the search results - analyze, synthesize, and present them in a sophisticated, conversational way. Make complex information understandable and engaging. Be naturally helpful and informative."
-            except:
-                pass
+        # System command keywords (don't search for these)
+        command_keywords = ['open', 'close', 'kill', 'start', 'stop', 'install', 'remove', 'delete', 'create file', 'write to', 'execute', 'run', 'launch']
         
-        elif any(keyword in user_input.lower() for keyword in news_keywords):
+        # Determine if this is an information query
+        is_info_query = any(keyword in user_input.lower() for keyword in info_keywords)
+        is_command = any(keyword in user_input.lower() for keyword in command_keywords)
+        is_news_query = any(keyword in user_input.lower() for keyword in news_keywords)
+        
+        # For news queries, use specialized news fetching
+        if is_news_query:
             try:
                 # Handle news queries with AI processing
                 region = self._detect_news_region(user_input)
+                print(f"\n[DEBUG] Fetching {region} news from internet...")
                 news_results = self.search_news(user_input, region)
+                print(f"[DEBUG] Fetched {len(news_results)} characters of news data")
+                print(f"[DEBUG] First 200 chars: {news_results[:200]}...")
                 
                 # AI should ALWAYS process and refine the results
-                search_context = f"\n\nNEWS SEARCH RESULTS:\n{news_results}\n\nIMPORTANT: You must process these search results and provide a conversational, JARVIS-like response. Do not just repeat the raw results. Instead:\n1. Analyze what information is available\n2. Summarize it in a natural, conversational way\n3. Be helpful and engaging like JARVIS\n4. If results are limited, acknowledge this conversationally and suggest alternatives\n5. Always maintain your sophisticated, friendly personality"
+                search_context = f"""
+
+🚨 CRITICAL - REAL-TIME NEWS DATA FETCHED FROM INTERNET 🚨
+
+The following news was JUST FETCHED from live news websites RIGHT NOW in {datetime.now().strftime('%B %Y')}. This is NOT from your training data. This is CURRENT, REAL-TIME news:
+
+{news_results}
+
+⚠️ INSTRUCTIONS:
+- PROCESS these 7 articles conversationally (NOT raw data)
+- Use ONLY these articles (NOT your training data - it's outdated)
+- ~400 words default | "in short" = ~150 words | "in detail" = ~600 words
+- Narrate naturally with sources, end with question
+- JARVIS-like: sophisticated, engaging, complete thoughts"""
             except Exception as e:
-                search_context = f"\n\nNews search failed. Respond conversationally like JARVIS, acknowledging the limitation and suggesting alternatives like visiting news websites directly."
+                search_context = f"\n\nNews search failed: {str(e)}. Respond conversationally like JARVIS, acknowledging the limitation and suggesting alternatives like visiting news websites directly."
+        
+        # For ALL other information queries (not news, not commands), search the internet
+        elif is_info_query and not is_command:
+            try:
+                print(f"\n[DEBUG] Information query detected, searching internet...")
+                
+                # Search both Wikipedia and Web for comprehensive results
+                wiki_results = self.search_wikipedia(user_input)
+                web_results = self.search_web(user_input)
+                
+                print(f"[DEBUG] Wikipedia: {len(wiki_results)} chars, Web: {len(web_results)} chars")
+                
+                # Combine results intelligently
+                combined_results = []
+                
+                if wiki_results and not ("failed" in wiki_results.lower() or "not found" in wiki_results.lower()):
+                    combined_results.append(f"📚 WIKIPEDIA KNOWLEDGE (Authoritative):\n{wiki_results}")
+                
+                if web_results and not ("couldn't find" in web_results.lower() or "unable to fetch" in web_results.lower()):
+                    combined_results.append(f"🌐 WEB SEARCH RESULTS (Current):\n{web_results}")
+                
+                if combined_results:
+                    search_context = f"""
+
+🚨 CRITICAL - REAL-TIME INTERNET DATA 🚨
+
+The following information was JUST FETCHED from the internet RIGHT NOW in {datetime.now().strftime('%B %Y')}:
+
+{chr(10).join(combined_results)}
+
+⚠️ INSTRUCTIONS:
+- PROCESS data conversationally (NOT raw)
+- Use internet data for facts, your knowledge for analysis
+- ~400 words default | "in short" = ~150 words | "in detail" = ~600 words
+- JARVIS-like: sophisticated, engaging, synthesize naturally"""
+                else:
+                    print("[DEBUG] No internet results, using LLM knowledge")
+            except Exception as e:
+                print(f"[DEBUG] Search failed: {e}")
+                pass
         
         # Check for weather and location queries
         weather_keywords = ['weather', 'temperature', 'climate', 'forecast', 'rain', 'sunny', 'cloudy', 'hot', 'cold', 'warm']
@@ -1567,6 +1624,62 @@ How may I assist you?
             print(f"\n\033[1;35m[WavesAI]\033[0m ➜ This operation requires sudo privileges, sir.")
             return self.command_handler.execute_command(f"sudo {command}")
     
+    def is_dangerous_command(self, command: str) -> bool:
+        """Check if command is dangerous and requires confirmation"""
+        command_lower = command.lower()
+        for pattern in self.dangerous_patterns:
+            if pattern in command_lower:
+                return True
+        return False
+    
+    def generate_confirmation_code(self) -> str:
+        """Generate a random 5-digit confirmation code"""
+        import random
+        return str(random.randint(10000, 99999))
+    
+    def request_confirmation(self, command: str) -> str:
+        """Request confirmation for dangerous command and return confirmation message"""
+        self.confirmation_code = self.generate_confirmation_code()
+        self.pending_dangerous_command = command
+        
+        # Determine what the command will do
+        risk_message = ""
+        if 'mkfs' in command.lower():
+            risk_message = "will PERMANENTLY ERASE all data on the specified drive"
+        elif 'rm -rf' in command.lower():
+            risk_message = "will PERMANENTLY DELETE files and directories"
+        elif 'dd if=' in command.lower():
+            risk_message = "will OVERWRITE data and can destroy entire drives"
+        elif 'shred' in command.lower() or 'wipe' in command.lower():
+            risk_message = "will SECURELY ERASE data making it unrecoverable"
+        elif 'fdisk' in command.lower() or 'parted' in command.lower():
+            risk_message = "will MODIFY disk partitions which can cause data loss"
+        elif 'lvremove' in command.lower() or 'vgremove' in command.lower():
+            risk_message = "will REMOVE LVM volumes and all data on them"
+        elif 'iptables -F' in command.lower():
+            risk_message = "will FLUSH all firewall rules leaving system unprotected"
+        elif 'reboot' in command.lower() or 'shutdown' in command.lower() or 'poweroff' in command.lower():
+            risk_message = "will RESTART/SHUTDOWN the system immediately"
+        elif 'systemctl isolate' in command.lower():
+            risk_message = "will CHANGE system target which may kill running processes"
+        else:
+            risk_message = "is a DANGEROUS operation that may cause system damage"
+        
+        return f"Sir, this command {risk_message}. This action cannot be undone. Please confirm with code: {self.confirmation_code}"
+    
+    def check_confirmation(self, user_input: str) -> bool:
+        """Check if user provided correct confirmation code"""
+        if not self.confirmation_code or not self.pending_dangerous_command:
+            return False
+        
+        # Check if user input contains the confirmation code
+        if f"confirm with code {self.confirmation_code}" in user_input.lower():
+            return True
+        elif self.confirmation_code in user_input:
+            return True
+        
+        return False
+    
     def interactive_mode(self):
         """Main interactive loop"""
         if not self.load_llm():
@@ -1584,6 +1697,42 @@ How may I assist you?
                 user_input = input("\n\033[1;36m[You]\033[0m ➜ ").strip()
                 
                 if not user_input:
+                    continue
+                
+                # Check if user is confirming a dangerous command
+                if self.check_confirmation(user_input):
+                    command = self.pending_dangerous_command
+                    print(f"\n\033[1;32m[Confirmed]\033[0m Executing dangerous command: {command}")
+                    
+                    # Execute the dangerous command
+                    if command.startswith('sudo '):
+                        actual_command = command[5:].strip()
+                        result = self.execute_with_sudo(actual_command)
+                    else:
+                        result = self.execute_command(command)
+                    
+                    # Clear pending command and code
+                    self.pending_dangerous_command = None
+                    self.confirmation_code = None
+                    
+                    # Show result
+                    if result['success']:
+                        if result['output']:
+                            print(f"\n\033[1;32m[Output]\033[0m\n{result['output']}")
+                        print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Operation completed, sir.")
+                    else:
+                        # Handle error conversationally
+                        if 'error_analysis' in result:
+                            analysis = result['error_analysis']
+                            error_prompt = f"""The command failed: {command}
+Error: {analysis['summary']}
+Details: {analysis.get('original_error', result.get('error', ''))}
+Solution: {analysis['solution']}
+
+Explain this error conversationally like JARVIS would."""
+                            print(f"\n\033[1;35m[WavesAI]\033[0m ➜ Analyzing error...", end='\r')
+                            conversational_response = self.generate_response(error_prompt)
+                            print(f"\033[1;35m[WavesAI]\033[0m ➜ {conversational_response}                    ")
                     continue
                 
                 if user_input.lower() in ['exit', 'quit', 'goodbye', 'bye']:
@@ -1636,13 +1785,11 @@ How may I assist you?
                     
                     print(f"\033[1;35m[WavesAI]\033[0m ➜ Executing: {command}                    ")
                     
-                    # Ask for confirmation for dangerous commands
-                    dangerous_keywords = ['reboot', 'shutdown', 'poweroff', 'halt', 'rm -rf', 'mkfs', 'dd']
-                    if any(keyword in command.lower() for keyword in dangerous_keywords):
-                        confirm = input(f"\n\033[1;33m[Confirm?]\033[0m This command will affect the system. Continue? (y/n): ")
-                        if confirm.lower() != 'y':
-                            print("\n\033[1;33m[Cancelled]\033[0m Command not executed.")
-                            continue
+                    # Check if command is dangerous and requires confirmation code
+                    if self.is_dangerous_command(command):
+                        confirmation_message = self.request_confirmation(command)
+                        print(f"\n\033[1;33m[⚠️  Warning]\033[0m {confirmation_message}")
+                        continue  # Wait for user to provide confirmation code
                     
                     # Check if command requires sudo
                     if command.startswith('sudo '):
