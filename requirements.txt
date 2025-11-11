@@ -9,6 +9,21 @@ pyyaml
 loguru
 python-dateutil
 
+# Voice Assistant Dependencies (Original)
+pyaudio
+webrtcvad
+openai-whisper
+noisereduce
+torch  # For GPU acceleration with Whisper
+
+# Improved Voice Mode Dependencies
+sounddevice
+faster-whisper
+scipy  # For audio processing
+
 # *CRITICAL STEP* 
 # Install llama-cpp-python
 # CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall --no-cache-dir --verbose
+
+# System Dependencies (install with pacman):
+# sudo pacman -S portaudio espeak-ng piper ffmpeg

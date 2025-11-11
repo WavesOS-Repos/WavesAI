@@ -14,9 +14,50 @@ import psutil
 import requests
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import threading
 import time
+import tempfile
+import shutil
+import wave
+import struct
+import queue
+import io
+from collections import deque
+import re
+
+# Audio and ML dependencies
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
+
+try:
+    import webrtcvad
+except ImportError:
+    webrtcvad = None
+
+try:
+    import whisper
+except ImportError:
+    whisper = None
+
+try:
+    import torch
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    torch = None
+    CUDA_AVAILABLE = False
+
+try:
+    import noisereduce as nr
+except ImportError:
+    nr = None
 
 # Import WavesAI modules
 from modules.search_engine import SearchEngine
@@ -433,6 +474,38 @@ class WavesAI:
         except Exception as e:
             return [f"Error checking alerts: {str(e)}"]
     
+    def init_voice_components(self):
+        """Initialize voice assistant components"""
+        # Get custom threshold from environment or use defaults based on testing
+        # Your mic shows avg 560, max 12069, so we need higher threshold
+        energy_threshold = int(os.getenv('WAVESAI_ENERGY_THRESHOLD', '1200'))
+        
+        self.voice_config = {
+            'sample_rate': 44100,  # Your device's native rate
+            'channels': 1,
+            'chunk_size': 2048,  # Larger chunks for 44100 Hz
+            'format': pyaudio.paInt16 if pyaudio else None,
+            'vad_mode': 3,  # Most aggressive VAD
+            'silence_threshold': 0.8,  # seconds of silence to stop recording
+            'energy_threshold': energy_threshold,  # Higher threshold for your mic
+            'silence_energy_ratio': 0.3,  # Silence is 30% of speech energy  
+            'min_speech_duration': 0.3,  # Minimum speech duration in seconds
+            'max_recording_duration': 20,  # Maximum recording duration
+            'pre_recording_buffer': 0.3,  # seconds to keep before speech
+            'whisper_model': os.getenv('WAVESAI_WHISPER_MODEL', 'base.en'),
+            'piper_model': os.getenv('WAVESAI_PIPER_MODEL'),
+            'tts_speed': float(os.getenv('WAVESAI_TTS_SPEED', '1.0')),
+            'enable_noise_reduction': os.getenv('WAVESAI_NOISE_REDUCTION', 'false').lower() == 'true',
+            'debug_audio': os.getenv('WAVESAI_DEBUG_AUDIO', 'false').lower() == 'true',
+            'use_dynamic_threshold': os.getenv('WAVESAI_DYNAMIC_THRESHOLD', 'false').lower() == 'true'
+        }
+        
+        # Audio processing queues
+        self.audio_queue = queue.Queue()
+        self.response_queue = queue.Queue()
+        self.is_speaking = False
+        self.stop_listening = False
+        
     def get_detailed_system_info(self) -> str:
         """Get detailed system information for monitoring"""
         try:
@@ -479,6 +552,796 @@ class WavesAI:
             
         except Exception as e:
             return f"Error generating system report: {str(e)}"
+    
+    def apply_noise_reduction(self, audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Apply noise reduction to audio data"""
+        if nr is None or not self.voice_config.get('enable_noise_reduction'):
+            return audio_data
+        try:
+            # Apply noise reduction
+            reduced = nr.reduce_noise(y=audio_data, sr=sample_rate, stationary=True)
+            return reduced
+        except Exception:
+            return audio_data
+    
+    def normalize_audio(self, audio_data: np.ndarray) -> np.ndarray:
+        """Normalize audio to prevent clipping"""
+        max_val = np.max(np.abs(audio_data))
+        if max_val > 0:
+            return audio_data * (0.95 / max_val)
+        return audio_data
+    
+    def tts_speak_advanced(self, text: str, interrupt_check=None):
+        """Advanced TTS with interruption support"""
+        # Clean text for TTS
+        text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)  # Remove markdown
+        text = re.sub(r'```[^`]*```', '', text)  # Remove code blocks
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)  # Convert links
+        text = text.strip()
+        
+        if not text:
+            return
+            
+        model = self.voice_config.get('piper_model')
+        speed = self.voice_config.get('tts_speed', 1.0)
+        
+        # Try Piper first (best quality)
+        if model and shutil.which("piper"):
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                out = tmp.name
+            try:
+                # Generate speech
+                cmd = ["piper", "--model", model, "--output_file", out]
+                if speed != 1.0:
+                    cmd.extend(["--length_scale", str(1.0/speed)])
+                
+                subprocess.run(cmd + ["--text", text], check=True, capture_output=True)
+                
+                # Play with interruption support
+                self.is_speaking = True
+                if shutil.which("aplay"):
+                    proc = subprocess.Popen(["aplay", "-q", out])
+                    while proc.poll() is None:
+                        if interrupt_check and interrupt_check():
+                            proc.terminate()
+                            break
+                        time.sleep(0.05)
+                elif shutil.which("ffplay"):
+                    proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", out])
+                    while proc.poll() is None:
+                        if interrupt_check and interrupt_check():
+                            proc.terminate()
+                            break
+                        time.sleep(0.05)
+                self.is_speaking = False
+            except Exception as e:
+                self.is_speaking = False
+                print(f"[TTS Error] {e}")
+            finally:
+                try:
+                    os.unlink(out)
+                except Exception:
+                    pass
+            return
+            
+        # Fallback to espeak-ng
+        elif shutil.which("espeak-ng"):
+            self.is_speaking = True
+            try:
+                speed_param = str(int(175 * speed))  # Default espeak speed is 175
+                proc = subprocess.Popen(["espeak-ng", "-s", speed_param, text])
+                while proc.poll() is None:
+                    if interrupt_check and interrupt_check():
+                        proc.terminate()
+                        break
+                    time.sleep(0.05)
+            except Exception:
+                pass
+            self.is_speaking = False
+            return
+            
+        # Last resort: print
+        print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {text}")
+    
+    def voice_mode(self):
+        """New voice mode using sounddevice like the working prototype"""
+        try:
+            import sounddevice as sd
+            import numpy as np
+            from scipy.io import wavfile
+            import tempfile
+            import time
+            from faster_whisper import WhisperModel
+        except ImportError as e:
+            print(f"\033[1;31m[Error]\033[0m Missing dependencies: {e}")
+            print("\033[1;33m[Install]\033[0m pip install sounddevice faster-whisper")
+            return
+        
+        # Load LLM if not already loaded
+        if not self.llm:
+            print("\033[1;33m[Loading]\033[0m Loading AI model...")
+            if not self.load_llm():
+                print("\033[1;31m[Error]\033[0m Failed to load AI model. Voice mode cannot continue.")
+                return
+        
+        config = {
+            'sample_rate': 16000,  # Start with 16kHz like your prototype
+            'channels': 1,
+            'vad_threshold': 0.015,  # From your prototype
+            'silence_duration': 1.5,
+            'min_recording_duration': 0.5,
+            'whisper_model': 'base'
+        }
+        
+        # Smart device detection (from your prototype)
+        def find_best_device():
+            """Find the best working microphone - exact logic from your prototype"""
+            print("\033[1;36m[🔍 Device Detection]\033[0m Scanning all audio devices...\n")
+            
+            devices = sd.query_devices()
+            candidates = []
+            
+            # Score all input devices (your exact scoring logic)
+            for idx, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    name = device['name'].lower()
+                    score = 0
+                    
+                    # Positive indicators (from your prototype)
+                    microphone_keywords = ['mic', 'microphone', 'webcam', 'camera', 'usb', 'input', 'capture']
+                    for keyword in microphone_keywords:
+                        if keyword in name:
+                            score += 20
+                    
+                    # Prefer USB devices
+                    if 'usb' in name:
+                        score += 15
+                    
+                    # Prefer webcam mics
+                    if 'webcam' in name or 'camera' in name:
+                        score += 25
+                    
+                    # Negative indicators
+                    bad_keywords = ['monitor', 'hdmi', 'displayport', 'output', 'speaker', 'headphone', 'sink']
+                    for keyword in bad_keywords:
+                        if keyword in name:
+                            score -= 50
+                    
+                    # Check channels
+                    channels = device.get('max_input_channels', 0)
+                    if 1 <= channels <= 2:
+                        score += 10
+                    elif channels > 8:
+                        score -= 10
+                    
+                    if score > 0:
+                        candidates.append((idx, device, score))
+                        print(f"  \033[1;32m[Device {idx}]\033[0m {device['name'][:50]} (Score: {score}, Channels: {channels})")
+            
+            if not candidates:
+                print("\033[1;31m[Error]\033[0m No input devices found!")
+                return None, None
+            
+            # Sort by score
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            
+            print("\n\033[1;36m[Testing Devices]\033[0m In order of preference...\n")
+            
+            # Test each device (your exact test logic)
+            sample_rates = [16000, 44100, 48000, 22050, 32000, 8000]
+            
+            for idx, device, score in candidates:
+                device_name = device['name']
+                print(f"  Testing: {device_name[:50]}...", end='')
+                
+                for rate in sample_rates:
+                    try:
+                        # Test recording
+                        test_duration = 0.1
+                        recording = sd.rec(
+                            int(test_duration * rate),
+                            samplerate=rate,
+                            channels=1,
+                            device=idx,
+                            dtype='float32'
+                        )
+                        sd.wait()
+                        
+                        # Check if we got real audio
+                        if recording is not None and len(recording) > 0:
+                            rms = np.sqrt(np.mean(recording**2))
+                            if not (np.isnan(rms) or rms == 0.0):
+                                print(f" \033[1;32m✓\033[0m")
+                                print(f"\n\033[1;32m[✓ Selected Device]\033[0m")
+                                print(f"  Name: {device_name}")
+                                print(f"  Index: {idx}")
+                                print(f"  Sample Rate: {rate} Hz")
+                                print(f"  Channels: {device['max_input_channels']}")
+                                print(f"  Score: {score}\n")
+                                return idx, rate
+                    except:
+                        continue
+                print(f" \033[1;31m✗\033[0m")
+            
+            return None, None
+        
+        # Find best device
+        device_index, sample_rate = find_best_device()
+        if device_index is None:
+            print("\033[1;31m[Failed]\033[0m Could not find working microphone")
+            return
+        
+        config['sample_rate'] = sample_rate
+        
+        # Load Whisper model
+        print("\033[1;33m[Loading]\033[0m Whisper model...", end='')
+        try:
+            if CUDA_AVAILABLE:
+                whisper_model = WhisperModel(config['whisper_model'], device="cuda", compute_type="float16")
+                print(" \033[1;32m✓ (CUDA)\033[0m")
+            else:
+                whisper_model = WhisperModel(config['whisper_model'], device="cpu", compute_type="int8")
+                print(" \033[1;32m✓ (CPU)\033[0m")
+        except:
+            print(" \033[1;31m✗\033[0m")
+            return
+        
+        # Voice activity detection (from your prototype)
+        class VoiceActivityDetector:
+            def __init__(self):
+                self.noise_floor = None
+                self.calibration_samples = []
+                self.is_calibrated = False
+                
+            def calibrate(self, audio_chunk):
+                if len(self.calibration_samples) < 10:
+                    rms = np.sqrt(np.mean(audio_chunk.flatten()**2))
+                    if not np.isnan(rms):
+                        self.calibration_samples.append(rms)
+                elif not self.is_calibrated:
+                    self.noise_floor = np.mean(self.calibration_samples) * 1.5
+                    self.is_calibrated = True
+                    print(f"\033[1;32m[Calibrated]\033[0m Noise floor: {self.noise_floor:.4f}")
+            
+            def is_voice_detected(self, audio_chunk):
+                rms = np.sqrt(np.mean(audio_chunk.flatten()**2))
+                threshold = self.noise_floor if self.is_calibrated else config['vad_threshold']
+                return rms > threshold and not np.isnan(rms), rms
+        
+        # Setup audio stream
+        audio_queue = queue.Queue()
+        vad = VoiceActivityDetector()
+        self.stop_listening = False
+        
+        def audio_callback(indata, frames, time_info, status):
+            if not vad.is_calibrated:
+                vad.calibrate(indata)
+            audio_queue.put(indata.copy())
+        
+        # Start stream
+        print("\033[1;36m[Starting Audio]\033[0m Opening stream...")
+        stream = sd.InputStream(
+            device=device_index,
+            samplerate=sample_rate,
+            channels=config['channels'],
+            callback=audio_callback,
+            blocksize=int(sample_rate * 0.1)
+        )
+        stream.start()
+        
+        # Calibration
+        print("\033[1;36m[Calibrating]\033[0m Adjusting to ambient noise...")
+        time.sleep(1.5)
+        
+        print("\033[1;32m[Ready]\033[0m Voice assistant active! Say 'exit' to quit.\n")
+        
+        # Main loop (exact logic from your prototype)
+        try:
+            while not self.stop_listening:
+                print("\033[1;32m[👂 Listening]\033[0m", end='', flush=True)
+                
+                recording_buffer = []
+                is_recording = False
+                silence_start = None
+                recording_start = None
+                
+                # Wait for speech
+                while not self.stop_listening:
+                    try:
+                        audio_chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    
+                    voice_detected, energy = vad.is_voice_detected(audio_chunk)
+                    
+                    if voice_detected and not is_recording:
+                        print(f"\n\033[1;33m[🎤 Recording]\033[0m Energy: {energy:.4f}", end='', flush=True)
+                        is_recording = True
+                        recording_start = time.time()
+                        recording_buffer = []
+                        silence_start = None
+                    
+                    if is_recording:
+                        recording_buffer.append(audio_chunk)
+                        
+                        if not voice_detected:
+                            if silence_start is None:
+                                silence_start = time.time()
+                            elif time.time() - silence_start >= config['silence_duration']:
+                                if time.time() - recording_start >= config['min_recording_duration']:
+                                    print(f"\n\033[1;32m[✓ Complete]\033[0m {time.time()-recording_start:.1f}s")
+                                    break
+                        else:
+                            silence_start = None
+                            print(".", end='', flush=True)
+                
+                if not recording_buffer or self.stop_listening:
+                    continue
+                
+                # Save and transcribe
+                audio_data = np.concatenate(recording_buffer, axis=0)
+                
+                # Save to temp file
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                    # Normalize
+                    max_val = np.max(np.abs(audio_data))
+                    if max_val > 0:
+                        audio_normalized = audio_data / max_val
+                    else:
+                        audio_normalized = audio_data
+                    
+                    audio_int16 = np.int16(audio_normalized * 32767)
+                    
+                    with wave.open(tmp_file.name, 'wb') as wf:
+                        wf.setnchannels(config['channels'])
+                        wf.setsampwidth(2)
+                        wf.setframerate(sample_rate)
+                        wf.writeframes(audio_int16.tobytes())
+                    
+                    tmp_path = tmp_file.name
+                
+                # Transcribe
+                print("\033[1;36m[Transcribing]\033[0m", end='', flush=True)
+                try:
+                    segments, _ = whisper_model.transcribe(
+                        tmp_path,
+                        beam_size=5,
+                        language="en",
+                        vad_filter=True,
+                        condition_on_previous_text=False
+                    )
+                    
+                    text = " ".join([s.text for s in segments]).strip()
+                    os.unlink(tmp_path)
+                    
+                    if text:
+                        print(" ✓")
+                        print(f"\n\033[1;36m[You]\033[0m {text}")
+                        
+                        # Check for exit
+                        if text.lower() in ['exit', 'quit', 'goodbye', 'bye', 'stop']:
+                            print("\033[1;35m[WavesAI]\033[0m Goodbye!")
+                            self.stop_listening = True
+                            break
+                        
+                        # Process with AI
+                        response = self.generate_response(text)
+                        print(f"\033[1;35m[WavesAI]\033[0m {response}")
+                        
+                        # TTS if available
+                        if hasattr(self, 'tts_speak_advanced'):
+                            self.tts_speak_advanced(response[:500])
+                    else:
+                        print(" (no speech)")
+                        
+                except Exception as e:
+                    print(f" ✗ {e}")
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                
+        except KeyboardInterrupt:
+            print("\n\033[1;33m[Interrupted]\033[0m")
+        finally:
+            stream.stop()
+            stream.close()
+            print("\033[1;35m[WavesAI]\033[0m Voice mode terminated.")
+    
+    def voice_mode_old(self):
+        """Enhanced voice mode with professional features"""
+        # Suppress ALSA warnings
+        import os
+        os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+        
+        # Redirect ALSA errors to /dev/null
+        try:
+            import ctypes
+            ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, 
+                                                  ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+            def py_error_handler(filename, line, function, err, fmt):
+                pass
+            c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
+            try:
+                asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+                asound.snd_lib_error_set_handler(c_error_handler)
+            except:
+                pass
+        except:
+            pass
+        
+        # Check dependencies
+        if pyaudio is None or np is None:
+            print("\033[1;31m[Error]\033[0m PyAudio and numpy required. Install: pip install pyaudio numpy")
+            return
+        if whisper is None:
+            print("\033[1;31m[Error]\033[0m Whisper required. Install: pip install openai-whisper")
+            return
+            
+        # Initialize components
+        self.init_voice_components()
+        
+        if not self.load_llm():
+            return
+            
+        # Start background services
+        self.start_monitoring_thread()
+        
+        # Custom voice startup
+        print("\n" + "="*60)
+        print("\033[1;36m         WAVESAI VOICE ASSISTANT ACTIVATED\033[0m")
+        print("="*60)
+        
+        # Load Whisper model
+        print(f"\n\033[1;33m[Initializing]\033[0m Loading Whisper model: {self.voice_config['whisper_model']}...")
+        try:
+            device = "cuda" if CUDA_AVAILABLE else "cpu"
+            self.whisper_model = whisper.load_model(
+                self.voice_config['whisper_model'],
+                device=device
+            )
+            print(f"\033[1;32m[Ready]\033[0m Whisper loaded on {device.upper()}")
+        except Exception as e:
+            print(f"\033[1;31m[Error]\033[0m Failed to load Whisper: {e}")
+            return
+            
+        # Initialize PyAudio with error suppression
+        import warnings
+        warnings.filterwarnings("ignore")
+        self.pa = pyaudio.PyAudio()
+        
+        # Initialize VAD
+        self.vad = None
+        if webrtcvad is not None:
+            try:
+                self.vad = webrtcvad.Vad(self.voice_config['vad_mode'])
+                print(f"\033[1;32m[Ready]\033[0m WebRTC VAD initialized (mode {self.voice_config['vad_mode']})")
+            except Exception:
+                print("\033[1;33m[Warning]\033[0m WebRTC VAD unavailable, using energy-based detection")
+                
+        # Audio processing state - IMPORTANT: Initialize recording state to False
+        self.audio_buffer = deque(maxlen=int(self.voice_config['sample_rate'] * 10))  # 10 seconds max
+        self.pre_buffer = deque(maxlen=int(self.voice_config['sample_rate'] * self.voice_config['pre_recording_buffer']))
+        self.is_recording = False  # MUST be False initially
+        self.silence_frames = 0
+        self.speech_frames = []
+        self.speech_energy_max = 0  # Track max energy during speech
+        self.ambient_noise_level = []  # Track ambient noise for dynamic threshold
+        self.recording_start_time = None  # Track when recording started
+        
+        # Welcome message
+        print("\n\033[1;35m[WavesAI]\033[0m Voice mode active. Speak naturally, I'm listening...")
+        print(f"\033[1;33m[Settings]\033[0m Initial energy threshold: {self.voice_config['energy_threshold']}")
+        print(f"\033[1;33m[Info]\033[0m Dynamic threshold enabled - will adjust to your environment")
+        print(f"\033[1;33m[Debug]\033[0m Run with WAVESAI_DEBUG_AUDIO=true to see real-time audio levels\n")
+        self.tts_speak_advanced("Voice assistant ready. How may I assist you today?")
+        
+        def process_audio_frame(frame_data: bytes) -> tuple:
+            """Process a single audio frame and return True if speech detected"""
+            # Convert to numpy
+            audio_np = np.frombuffer(frame_data, dtype=np.int16).astype(np.float32)
+            
+            # Calculate energy
+            energy = np.sqrt(np.mean(audio_np ** 2))
+            
+            # For VAD, we need exactly 10, 20, or 30ms of audio at supported rates
+            # Calculate the required frame size for VAD
+            vad_frame_duration_ms = 30  # Use 30ms frames for VAD
+            vad_frame_size = int(self.voice_config['sample_rate'] * vad_frame_duration_ms / 1000) * 2  # *2 for int16
+            
+            is_speech = False
+            
+            # Since we're using 44100 Hz, VAD won't work - use energy-based detection only
+            # VAD only supports 8000, 16000, 32000, 48000 Hz
+            is_speech = energy > self.voice_config['energy_threshold']
+            
+            # Optional: Add a minimum energy to avoid noise
+            if is_speech and energy < 100:  # Ignore very quiet sounds
+                is_speech = False
+                
+            return is_speech, energy
+            
+        def transcribe_audio(audio_data: np.ndarray) -> str:
+            """Transcribe audio using Whisper"""
+            try:
+                # Ensure we have enough audio (at least 0.5 seconds)
+                min_samples = int(self.voice_config['sample_rate'] * 0.5)
+                if len(audio_data) < min_samples:
+                    print(f"\033[1;33m[Warning]\033[0m Audio too short: {len(audio_data)} samples")
+                    return ""
+                
+                # Apply noise reduction
+                if self.voice_config.get('enable_noise_reduction'):
+                    audio_data = self.apply_noise_reduction(audio_data, self.voice_config['sample_rate'])
+                    
+                # Normalize audio to prevent clipping
+                audio_data = self.normalize_audio(audio_data)
+                
+                # Ensure audio is float32 in range [-1, 1]
+                if audio_data.dtype != np.float32:
+                    audio_data = audio_data.astype(np.float32)
+                
+                # Pad audio if needed (Whisper prefers at least 1 second)
+                if len(audio_data) < self.voice_config['sample_rate']:
+                    padding = self.voice_config['sample_rate'] - len(audio_data)
+                    audio_data = np.pad(audio_data, (0, padding), mode='constant')
+                
+                # Transcribe with optimized parameters
+                result = self.whisper_model.transcribe(
+                    audio_data,
+                    language='en',
+                    temperature=0.2,  # Slightly higher for better recognition
+                    no_speech_threshold=0.4,  # Lower threshold to catch more speech
+                    logprob_threshold=-1.0,
+                    compression_ratio_threshold=2.4,
+                    condition_on_previous_text=False,  # Faster without context
+                    fp16=CUDA_AVAILABLE  # Use FP16 on GPU to save memory
+                )
+                
+                text = result['text'].strip()
+                
+                # Filter out common noise transcriptions (single words that are often mistakes)
+                noise_patterns = ['you', 'yeah', 'yes', 'no', 'oh', 'um', 'uh', 'thank you', 'thanks', '[Music]', '[Applause]']
+                if text.lower() in noise_patterns and len(text.split()) == 1:
+                    print(f"\033[1;33m[Filtered]\033[0m Noise pattern: {text}")
+                    return ""
+                
+                # Only filter if it's too short and looks like noise
+                if len(text) < 3 and not any(c.isalnum() for c in text):
+                    return ""
+                    
+                return text
+            except Exception as e:
+                print(f"\033[1;31m[Transcription Error]\033[0m {e}")
+                return ""
+                
+        def process_user_input(text: str):
+            """Process transcribed text and generate response"""
+            if not text:
+                return
+                
+            print(f"\n\033[1;36m[You]\033[0m {text}")
+            
+            # Check for exit commands
+            if text.lower() in ['exit', 'quit', 'goodbye', 'bye', 'stop']:
+                self.tts_speak_advanced("Goodbye! Have a great day.")
+                self.stop_listening = True
+                return
+                
+            # Process through existing handlers
+            try:
+                # Check file operations
+                file_response = self._handle_file_operations(text)
+                if file_response:
+                    self.tts_speak_advanced(file_response[:500])
+                    return
+                    
+                # Check smart commands
+                smart_response = self.smart_execute(text)
+                if smart_response:
+                    self.tts_speak_advanced(smart_response[:500])
+                    return
+                    
+                # Generate AI response
+                print("\033[1;33m[Processing]\033[0m Thinking...", end='\r')
+                response = self.generate_response(text)
+                response = self.validate_response(text, response)
+                
+                # Clean up the processing message
+                print(" " * 50, end='\r')
+                
+                # Speak response (limit length for voice)
+                if len(response) > 500:
+                    spoken_response = response[:497] + "..."
+                    print(f"\033[1;35m[WavesAI]\033[0m {response}")
+                    self.tts_speak_advanced(spoken_response)
+                else:
+                    print(f"\033[1;35m[WavesAI]\033[0m {response}")
+                    self.tts_speak_advanced(response)
+                    
+            except Exception as e:
+                error_msg = f"I encountered an error: {str(e)[:100]}"
+                print(f"\033[1;31m[Error]\033[0m {e}")
+                self.tts_speak_advanced(error_msg)
+                
+        def audio_callback(in_data, frame_count, time_info, status):
+            """PyAudio callback for continuous audio processing"""
+            # Ignore status messages unless it's an error
+            if status and status != 2:  # 2 is input overflow, common and harmless
+                print(f"\033[1;33m[Audio Warning]\033[0m Status code: {status}")
+                
+            # Add to pre-buffer
+            self.pre_buffer.append(in_data)
+            
+            # Process frame
+            is_speech, energy = process_audio_frame(in_data)
+            
+            # Dynamic threshold adjustment - track ambient noise when not recording
+            if not self.is_recording and not self.is_speaking:
+                self.ambient_noise_level.append(energy)
+                if len(self.ambient_noise_level) > 50:  # Keep last 50 samples
+                    self.ambient_noise_level.pop(0)
+                    # Adjust threshold based on ambient noise
+                    if self.voice_config.get('use_dynamic_threshold'):
+                        avg_noise = sum(self.ambient_noise_level) / len(self.ambient_noise_level)
+                        # Set threshold to 2x ambient noise, but keep minimum of 600
+                        self.voice_config['energy_threshold'] = max(600, min(1500, avg_noise * 2))
+            
+            # Debug mode - show energy levels
+            if self.voice_config.get('debug_audio'):
+                energy_bar = '█' * min(int(energy / 50), 40)
+                threshold_marker = '|' if energy > self.voice_config['energy_threshold'] else ' '
+                print(f"\r\033[1;34m[Energy: {energy:4.0f}/{self.voice_config['energy_threshold']:.0f}]\033[0m {threshold_marker} {energy_bar}", end='', flush=True)
+            
+            if not self.is_speaking:  # Don't record while speaking
+                if is_speech and not self.is_recording:
+                    # Start recording
+                    self.is_recording = True
+                    self.recording_start_time = time.time()
+                    self.speech_frames = list(self.pre_buffer)[-10:]  # Include last 10 frames of pre-buffer
+                    self.silence_frames = 0
+                    self.speech_energy_max = energy
+                    if self.voice_config.get('debug_audio'):
+                        print(f"\n\033[1;32m[Speech Detected! Energy: {energy:.0f} > {self.voice_config['energy_threshold']}]\033[0m", flush=True)
+                    print("\n\033[1;32m[Recording]\033[0m", end='', flush=True)
+                        
+                elif self.is_recording:
+                    # Track max energy during speech
+                    if energy > self.speech_energy_max:
+                        self.speech_energy_max = energy
+                    
+                    # Add frame to recording
+                    self.speech_frames.append(in_data)
+                    
+                    # Calculate recording duration
+                    recording_duration = len(self.speech_frames) * (self.voice_config['chunk_size'] / self.voice_config['sample_rate'])
+                    
+                    # Check for maximum recording duration
+                    if recording_duration >= self.voice_config.get('max_recording_duration', 30):
+                        print(" \033[1;33m[Max duration reached, processing]\033[0m", flush=True)
+                        self.is_recording = False
+                        # Process the audio...
+                        audio_bytes = b''.join(self.speech_frames)
+                        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                        
+                        def transcribe_and_respond():
+                            text = transcribe_audio(audio_np)
+                            if text:
+                                process_user_input(text)
+                        
+                        thread = threading.Thread(target=transcribe_and_respond)
+                        thread.daemon = True
+                        thread.start()
+                        
+                        self.speech_frames = []
+                        self.silence_frames = 0
+                        self.speech_energy_max = 0
+                        return (in_data, pyaudio.paContinue)
+                    
+                    # Dynamic silence threshold - use fixed ratio of initial threshold
+                    silence_threshold = self.voice_config['energy_threshold'] * 0.3  # 30% of speech threshold
+                    
+                    if energy < silence_threshold:  # This is silence
+                        self.silence_frames += 1
+                        
+                        # Check if we have enough speech and silence threshold reached
+                        silence_duration = self.silence_frames * (self.voice_config['chunk_size'] / self.voice_config['sample_rate'])
+                        
+                        if recording_duration >= self.voice_config['min_speech_duration'] and silence_duration >= self.voice_config['silence_threshold']:
+                            # Stop recording and process
+                            print(" \033[1;33m[Processing]\033[0m", flush=True)
+                            self.is_recording = False
+                            
+                            # Convert frames to numpy array
+                            audio_bytes = b''.join(self.speech_frames)
+                            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                            
+                            # Transcribe in thread to not block audio
+                            def transcribe_and_respond():
+                                text = transcribe_audio(audio_np)
+                                if text:
+                                    process_user_input(text)
+                                    
+                            thread = threading.Thread(target=transcribe_and_respond)
+                            thread.daemon = True
+                            thread.start()
+                            
+                            # Reset
+                            self.speech_frames = []
+                            self.silence_frames = 0
+                            self.speech_energy_max = 0
+                    else:  # Still speaking
+                        self.silence_frames = 0  # Reset silence counter
+                        if not self.voice_config.get('debug_audio'):
+                            print(".", end='', flush=True)
+            return (in_data, pyaudio.paContinue)
+            
+        # Start audio stream with fallback sample rates
+        try:
+            # Try to get default input device info
+            try:
+                default_device = self.pa.get_default_input_device_info()
+                max_sample_rate = int(default_device.get('defaultSampleRate', 16000))
+                print(f"\033[1;32m[Audio]\033[0m Default device: {default_device.get('name', 'Unknown')}")
+                print(f"\033[1;32m[Audio]\033[0m Max sample rate: {max_sample_rate} Hz")
+            except:
+                max_sample_rate = 48000
+            
+            # Try different sample rates - start with what the device supports
+            sample_rates_to_try = [44100, 48000, 16000, 8000]
+            if max_sample_rate not in sample_rates_to_try and max_sample_rate > 0:
+                sample_rates_to_try.insert(0, max_sample_rate)
+            
+            stream = None
+            actual_sample_rate = None
+            
+            for rate in sample_rates_to_try:
+                try:
+                    # Update config with working sample rate
+                    self.voice_config['sample_rate'] = rate
+                    # Adjust chunk size based on sample rate (aim for ~50ms chunks)
+                    self.voice_config['chunk_size'] = int(rate * 0.05)  # 50ms of audio
+                    
+                    stream = self.pa.open(
+                        format=self.voice_config['format'],
+                        channels=self.voice_config['channels'],
+                        rate=rate,
+                        input=True,
+                        frames_per_buffer=self.voice_config['chunk_size'],
+                        stream_callback=audio_callback
+                    )
+                    actual_sample_rate = rate
+                    print(f"\033[1;32m[Audio]\033[0m Using sample rate: {rate} Hz with chunk size: {self.voice_config['chunk_size']}")
+                    break
+                except Exception as e:
+                    if rate == sample_rates_to_try[-1]:
+                        raise Exception(f"Could not open audio stream with any sample rate. Last error: {e}")
+                    continue
+            
+            if stream is None:
+                raise Exception("Failed to open audio stream")
+                
+            stream.start_stream()
+            
+            # Main loop
+            while stream.is_active() and not self.stop_listening:
+                time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            print("\n\033[1;33m[Interrupted]\033[0m Shutting down...")
+        except Exception as e:
+            print(f"\n\033[1;31m[Error]\033[0m {e}")
+        finally:
+            # Cleanup
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+            try:
+                self.pa.terminate()
+            except Exception:
+                pass
+                
+            print("\n\033[1;35m[WavesAI]\033[0m Voice mode terminated. Goodbye!\n")
     
     # Removed duplicate smart_execute method - now uses command_handler.smart_execute() only
     
@@ -1904,7 +2767,25 @@ def main():
     """)
     
     ai = WavesAI()
-    ai.interactive_mode()
+    
+    # Check for voice modes
+    if any(arg in sys.argv for arg in ["--voice", "voice"]):
+        # Use the new sounddevice-based voice mode by default
+        ai.voice_mode()
+    elif any(arg in sys.argv for arg in ["--voice-old", "voice-pyaudio"]):
+        # Old PyAudio-based voice mode (broken)
+        ai.voice_mode_old()
+    elif any(arg in sys.argv for arg in ["--voice-improved", "voice2"]):
+        # Standalone improved voice mode
+        try:
+            from wavesai_voice_improved import ImprovedVoiceMode
+            voice = ImprovedVoiceMode(ai)
+            voice.run()
+        except ImportError as e:
+            print(f"\033[1;31m[Error]\033[0m Improved voice mode not available: {e}")
+            print("\033[1;33m[Tip]\033[0m Run: pip install sounddevice faster-whisper")
+    else:
+        ai.interactive_mode()
 
 if __name__ == "__main__":
     main()
