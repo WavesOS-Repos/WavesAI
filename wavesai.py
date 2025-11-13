@@ -86,7 +86,7 @@ def load_config():
     
     # Fallback to defaults
     return {
-        "model_path": str(Path.home() / ".wavesai/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+        "model_path": str(Path.home() / "/home/bowser/.wavesai/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf"),
         "database": str(Path.home() / ".wavesai/config/memory.db"),
         "log_file": str(Path.home() / ".wavesai/config/logs/wavesai.log"),
         "context_length": 4096,
@@ -493,9 +493,11 @@ class WavesAI:
             'max_recording_duration': 20,  # Maximum recording duration
             'pre_recording_buffer': 0.3,  # seconds to keep before speech
             'whisper_model': os.getenv('WAVESAI_WHISPER_MODEL', 'base.en'),
-            'piper_model': os.getenv('WAVESAI_PIPER_MODEL'),
+            'piper_model': os.getenv('WAVESAI_PIPER_MODEL', '/home/bowser/.wavesai/models/tts/bryce.onnx'),
             'tts_speed': float(os.getenv('WAVESAI_TTS_SPEED', '1.0')),
             'enable_noise_reduction': os.getenv('WAVESAI_NOISE_REDUCTION', 'false').lower() == 'true',
+            'smart_noise_cancellation': os.getenv('WAVESAI_SMART_NOISE_CANCELLATION', 'true').lower() == 'true',
+            'noise_learning': os.getenv('WAVESAI_NOISE_LEARNING', 'true').lower() == 'true',
             'debug_audio': os.getenv('WAVESAI_DEBUG_AUDIO', 'false').lower() == 'true',
             'use_dynamic_threshold': os.getenv('WAVESAI_DYNAMIC_THRESHOLD', 'false').lower() == 'true'
         }
@@ -553,16 +555,155 @@ class WavesAI:
         except Exception as e:
             return f"Error generating system report: {str(e)}"
     
-    def apply_noise_reduction(self, audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
-        """Apply noise reduction to audio data"""
-        if nr is None or not self.voice_config.get('enable_noise_reduction'):
-            return audio_data
+    def init_smart_noise_detection(self):
+        """Initialize smart background noise detection system"""
+        if not hasattr(self, 'noise_profile'):
+            self.noise_profile = {
+                'background_samples': deque(maxlen=100),  # Store background noise samples
+                'noise_floor': 0.0,
+                'adaptive_threshold': 0.0,
+                'noise_type': 'unknown',
+                'calibrated': False,
+                'last_calibration': 0,
+                'noise_reduction_strength': 0.5,
+                'spectral_profile': None
+            }
+    
+    def analyze_background_noise(self, audio_chunk: np.ndarray, sample_rate: int) -> dict:
+        """Analyze background noise characteristics for smart cancellation"""
         try:
-            # Apply noise reduction
-            reduced = nr.reduce_noise(y=audio_data, sr=sample_rate, stationary=True)
+            # Initialize if needed
+            if not hasattr(self, 'noise_profile'):
+                self.init_smart_noise_detection()
+            
+            # Calculate energy and spectral features
+            energy = np.sqrt(np.mean(audio_chunk ** 2))
+            
+            # Spectral analysis for noise characterization
+            if len(audio_chunk) >= 512:
+                # Simple spectral analysis
+                fft = np.fft.rfft(audio_chunk)
+                magnitude = np.abs(fft)
+                
+                # Detect noise patterns
+                low_freq_energy = np.mean(magnitude[:len(magnitude)//4])  # 0-25% of spectrum
+                mid_freq_energy = np.mean(magnitude[len(magnitude)//4:3*len(magnitude)//4])  # 25-75%
+                high_freq_energy = np.mean(magnitude[3*len(magnitude)//4:])  # 75-100%
+                
+                # Classify noise type
+                if high_freq_energy > low_freq_energy * 2:
+                    noise_type = 'hiss'  # High frequency noise (fan, air conditioning)
+                elif low_freq_energy > mid_freq_energy * 1.5:
+                    noise_type = 'rumble'  # Low frequency noise (traffic, machinery)
+                elif mid_freq_energy > (low_freq_energy + high_freq_energy) * 0.7:
+                    noise_type = 'broadband'  # General ambient noise
+                else:
+                    noise_type = 'clean'
+                
+                self.noise_profile['noise_type'] = noise_type
+                self.noise_profile['spectral_profile'] = {
+                    'low': low_freq_energy,
+                    'mid': mid_freq_energy, 
+                    'high': high_freq_energy
+                }
+            
+            return {
+                'energy': energy,
+                'noise_type': self.noise_profile.get('noise_type', 'unknown'),
+                'spectral_profile': self.noise_profile.get('spectral_profile', {}),
+                'recommended_reduction': min(0.8, max(0.1, energy * 2))  # Adaptive strength
+            }
+            
+        except Exception as e:
+            return {'energy': 0, 'noise_type': 'unknown', 'error': str(e)}
+    
+    def smart_noise_cancellation(self, audio_data: np.ndarray, sample_rate: int, speech_detected: bool = False) -> np.ndarray:
+        """Apply smart noise cancellation based on detected background noise"""
+        try:
+            # Initialize if needed
+            if not hasattr(self, 'noise_profile'):
+                self.init_smart_noise_detection()
+            
+            # If no noise reduction library available, return original
+            if nr is None:
+                return audio_data
+            
+            # Analyze current noise profile
+            noise_analysis = self.analyze_background_noise(audio_data, sample_rate)
+            
+            # Determine reduction strategy based on noise type and speech presence
+            if speech_detected:
+                # During speech, use gentler noise reduction to preserve voice quality
+                if noise_analysis['noise_type'] == 'hiss':
+                    # High-freq noise: gentle high-freq reduction
+                    reduced = nr.reduce_noise(
+                        y=audio_data, sr=sample_rate,
+                        stationary=True,
+                        prop_decrease=0.6,  # Moderate reduction
+                        freq_mask_smooth_hz=1000
+                    )
+                elif noise_analysis['noise_type'] == 'rumble':
+                    # Low-freq noise: focus on low frequencies
+                    reduced = nr.reduce_noise(
+                        y=audio_data, sr=sample_rate,
+                        stationary=False,  # Non-stationary for traffic/machinery
+                        prop_decrease=0.8,  # Stronger reduction for low-freq
+                        freq_mask_smooth_hz=500
+                    )
+                else:
+                    # General broadband noise: balanced approach
+                    reduced = nr.reduce_noise(
+                        y=audio_data, sr=sample_rate,
+                        stationary=True,
+                        prop_decrease=0.7
+                    )
+            else:
+                # During silence/background: stronger noise reduction for calibration
+                reduced = nr.reduce_noise(
+                    y=audio_data, sr=sample_rate,
+                    stationary=True,
+                    prop_decrease=min(0.9, noise_analysis.get('recommended_reduction', 0.7))
+                )
+                
+                # Store background sample for learning
+                if len(self.noise_profile['background_samples']) < 100:
+                    self.noise_profile['background_samples'].append(noise_analysis['energy'])
+                    
+                    # Update noise floor
+                    if len(self.noise_profile['background_samples']) >= 10:
+                        self.noise_profile['noise_floor'] = np.mean(self.noise_profile['background_samples'])
+                        self.noise_profile['calibrated'] = True
+            
             return reduced
-        except Exception:
+            
+        except Exception as e:
+            # Fallback to basic noise reduction or original audio
+            try:
+                return nr.reduce_noise(y=audio_data, sr=sample_rate, stationary=True)
+            except:
+                return audio_data
+    
+    def apply_noise_reduction(self, audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Apply noise reduction to audio data with smart detection"""
+        # Initialize voice config if not exists
+        if not hasattr(self, 'voice_config'):
+            self.init_voice_components()
+            
+        # Check if noise reduction is enabled (now enabled by default for smart cancellation)
+        if nr is None or (not self.voice_config.get('enable_noise_reduction') and 
+                         not self.voice_config.get('smart_noise_cancellation', True)):
             return audio_data
+            
+        # Use smart noise cancellation if available
+        if self.voice_config.get('smart_noise_cancellation', True):
+            return self.smart_noise_cancellation(audio_data, sample_rate, speech_detected=False)
+        else:
+            # Fallback to basic noise reduction
+            try:
+                reduced = nr.reduce_noise(y=audio_data, sr=sample_rate, stationary=True)
+                return reduced
+            except Exception:
+                return audio_data
     
     def normalize_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """Normalize audio to prevent clipping"""
@@ -573,6 +714,10 @@ class WavesAI:
     
     def tts_speak_advanced(self, text: str, interrupt_check=None):
         """Advanced TTS with interruption support"""
+        # Initialize voice config if not exists
+        if not hasattr(self, 'voice_config'):
+            self.init_voice_components()
+            
         # Clean text for TTS
         text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)  # Remove markdown
         text = re.sub(r'```[^`]*```', '', text)  # Remove code blocks
@@ -656,6 +801,12 @@ class WavesAI:
             print(f"\033[1;31m[Error]\033[0m Missing dependencies: {e}")
             print("\033[1;33m[Install]\033[0m pip install sounddevice faster-whisper")
             return
+        
+        # Initialize voice configuration for TTS
+        self.init_voice_components()
+        
+        # Initialize smart noise detection system
+        self.init_smart_noise_detection()
         
         # Load LLM if not already loaded
         if not self.llm:
@@ -880,6 +1031,14 @@ class WavesAI:
                 
                 # Save and transcribe
                 audio_data = np.concatenate(recording_buffer, axis=0)
+                
+                # Apply smart noise cancellation before transcription
+                if hasattr(self, 'smart_noise_cancellation'):
+                    try:
+                        print(" \033[1;33m[🔇 Noise Reduction]\033[0m", end='', flush=True)
+                        audio_data = self.smart_noise_cancellation(audio_data, sample_rate, speech_detected=True)
+                    except Exception as e:
+                        print(f" \033[1;31m[Noise reduction failed: {e}]\033[0m", end='', flush=True)
                 
                 # Save to temp file
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
