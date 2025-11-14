@@ -499,12 +499,31 @@ class WavesAI:
             'smart_noise_cancellation': os.getenv('WAVESAI_SMART_NOISE_CANCELLATION', 'true').lower() == 'true',
             'noise_learning': os.getenv('WAVESAI_NOISE_LEARNING', 'true').lower() == 'true',
             'debug_audio': os.getenv('WAVESAI_DEBUG_AUDIO', 'false').lower() == 'true',
-            'use_dynamic_threshold': os.getenv('WAVESAI_DYNAMIC_THRESHOLD', 'false').lower() == 'true'
+            'use_dynamic_threshold': os.getenv('WAVESAI_DYNAMIC_THRESHOLD', 'false').lower() == 'true',
+            # Echo prevention settings
+            'echo_prevention': os.getenv('WAVESAI_ECHO_PREVENTION', 'aggressive').lower(),
+            'post_speech_delay': float(os.getenv('WAVESAI_POST_SPEECH_DELAY', '2.0')),
+            'interrupt_sensitivity': os.getenv('WAVESAI_INTERRUPT_SENSITIVITY', 'medium').lower(),
+            'enable_stop_commands': os.getenv('WAVESAI_ENABLE_STOP_COMMANDS', 'true').lower() == 'true',
+            'stop_words': ['stop', 'quiet', 'pause', 'silence', 'shut up', 'enough']
         }
         
         # Audio processing queues
         self.audio_queue = queue.Queue()
         self.response_queue = queue.Queue()
+        
+        # Conversation state management for echo prevention
+        self.conversation_state = {
+            'is_speaking': False,
+            'is_listening': True,
+            'last_speech_end': 0,
+            'interrupt_requested': False,
+            'user_interrupted': False,
+            'silence_start': None,
+            'post_speech_timer': 0
+        }
+        
+        # Legacy compatibility
         self.is_speaking = False
         self.stop_listening = False
         
@@ -712,11 +731,101 @@ class WavesAI:
             return audio_data * (0.95 / max_val)
         return audio_data
     
+    def detect_stop_command(self, text: str) -> bool:
+        """Detect if user wants to stop/interrupt the AI"""
+        if not self.voice_config.get('enable_stop_commands', True):
+            return False
+            
+        text_lower = text.lower().strip()
+        stop_words = self.voice_config.get('stop_words', [])
+        
+        # Check for exact matches or stop words at the beginning
+        for stop_word in stop_words:
+            if text_lower == stop_word or text_lower.startswith(stop_word + ' '):
+                return True
+                
+        # Check for urgent interrupt patterns
+        urgent_patterns = ['stop talking', 'be quiet', 'shut up', 'enough already']
+        for pattern in urgent_patterns:
+            if pattern in text_lower:
+                return True
+                
+        return False
+    
+    def should_ignore_audio(self) -> bool:
+        """Determine if audio input should be ignored to prevent feedback"""
+        current_time = time.time()
+        
+        # Always ignore if AI is currently speaking
+        if self.conversation_state['is_speaking']:
+            return True
+            
+        # Ignore during post-speech delay period
+        time_since_speech = current_time - self.conversation_state['last_speech_end']
+        post_delay = self.voice_config.get('post_speech_delay', 2.0)
+        
+        if time_since_speech < post_delay:
+            return True
+            
+        # Check echo prevention level
+        echo_mode = self.voice_config.get('echo_prevention', 'aggressive')
+        if echo_mode == 'off':
+            return False
+        elif echo_mode == 'light' and time_since_speech < 0.5:
+            return True
+        elif echo_mode in ['moderate', 'aggressive'] and time_since_speech < post_delay:
+            return True
+            
+        return False
+    
+    def start_speaking(self):
+        """Mark the start of AI speech output"""
+        self.conversation_state['is_speaking'] = True
+        self.conversation_state['is_listening'] = False
+        self.conversation_state['interrupt_requested'] = False
+        self.is_speaking = True  # Legacy compatibility
+        
+    def stop_speaking(self):
+        """Mark the end of AI speech output and start post-speech delay"""
+        self.conversation_state['is_speaking'] = False
+        self.conversation_state['last_speech_end'] = time.time()
+        self.conversation_state['post_speech_timer'] = time.time()
+        self.is_speaking = False  # Legacy compatibility
+        
+        # Start listening again after delay
+        delay = self.voice_config.get('post_speech_delay', 2.0)
+        if self.voice_config.get('echo_prevention', 'aggressive') != 'off':
+            threading.Timer(delay, self.resume_listening).start()
+        else:
+            self.resume_listening()
+    
+    def resume_listening(self):
+        """Resume listening after post-speech delay"""
+        if not self.conversation_state['is_speaking']:
+            self.conversation_state['is_listening'] = True
+    
+    def request_interrupt(self):
+        """Request immediate interruption of AI speech"""
+        self.conversation_state['interrupt_requested'] = True
+        self.conversation_state['user_interrupted'] = True
+        
+    def check_interrupt(self) -> bool:
+        """Check if speech should be interrupted"""
+        return self.conversation_state['interrupt_requested'] or self.stop_listening
+    
     def tts_speak_advanced(self, text: str, interrupt_check=None):
-        """Advanced TTS with interruption support"""
+        """Advanced TTS with echo prevention and interruption support"""
         # Initialize voice config if not exists
         if not hasattr(self, 'voice_config'):
             self.init_voice_components()
+        
+        # Initialize conversation state if not exists
+        if not hasattr(self, 'conversation_state'):
+            self.conversation_state = {
+                'is_speaking': False, 'is_listening': True, 'last_speech_end': 0,
+                'interrupt_requested': False, 'user_interrupted': False,
+                'silence_start': None, 'post_speech_timer': 0
+            }
             
         # Clean text for TTS
         text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)  # Remove markdown
@@ -727,66 +836,74 @@ class WavesAI:
         if not text:
             return
             
-        model = self.voice_config.get('piper_model')
-        speed = self.voice_config.get('tts_speed', 1.0)
+        # Start speaking state - this prevents audio input
+        self.start_speaking()
         
-        # Try Piper first (best quality)
-        if model and shutil.which("piper"):
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                out = tmp.name
-            try:
-                # Generate speech
-                cmd = ["piper", "--model", model, "--output_file", out]
-                if speed != 1.0:
-                    cmd.extend(["--length_scale", str(1.0/speed)])
-                
-                subprocess.run(cmd + ["--text", text], check=True, capture_output=True)
-                
-                # Play with interruption support
-                self.is_speaking = True
-                if shutil.which("aplay"):
-                    proc = subprocess.Popen(["aplay", "-q", out])
-                    while proc.poll() is None:
-                        if interrupt_check and interrupt_check():
-                            proc.terminate()
-                            break
-                        time.sleep(0.05)
-                elif shutil.which("ffplay"):
-                    proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", out])
-                    while proc.poll() is None:
-                        if interrupt_check and interrupt_check():
-                            proc.terminate()
-                            break
-                        time.sleep(0.05)
-                self.is_speaking = False
-            except Exception as e:
-                self.is_speaking = False
-                print(f"[TTS Error] {e}")
-            finally:
+        try:
+            model = self.voice_config.get('piper_model')
+            speed = self.voice_config.get('tts_speed', 1.0)
+            
+            # Try Piper first (best quality)
+            if model and shutil.which("piper"):
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    out = tmp.name
                 try:
-                    os.unlink(out)
+                    # Generate speech
+                    cmd = ["piper", "--model", model, "--output_file", out]
+                    if speed != 1.0:
+                        cmd.extend(["--length_scale", str(1.0/speed)])
+                    
+                    subprocess.run(cmd + ["--text", text], check=True, capture_output=True)
+                    
+                    # Play with enhanced interruption support
+                    if shutil.which("aplay"):
+                        proc = subprocess.Popen(["aplay", "-q", out])
+                        while proc.poll() is None:
+                            # Check multiple interrupt conditions
+                            if (interrupt_check and interrupt_check()) or self.check_interrupt():
+                                proc.terminate()
+                                print(" \033[1;33m[🛑 Interrupted]\033[0m")
+                                break
+                            time.sleep(0.05)
+                    elif shutil.which("ffplay"):
+                        proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", out])
+                        while proc.poll() is None:
+                            if (interrupt_check and interrupt_check()) or self.check_interrupt():
+                                proc.terminate()
+                                print(" \033[1;33m[🛑 Interrupted]\033[0m")
+                                break
+                            time.sleep(0.05)
+                except Exception as e:
+                    print(f"[TTS Error] {e}")
+                finally:
+                    try:
+                        os.unlink(out)
+                    except Exception:
+                        pass
+                return
+                
+            # Fallback to espeak-ng  
+            elif shutil.which("espeak-ng"):
+                try:
+                    speed_param = str(int(175 * speed))  # Default espeak speed is 175
+                    proc = subprocess.Popen(["espeak-ng", "-s", speed_param, text])
+                    while proc.poll() is None:
+                        if (interrupt_check and interrupt_check()) or self.check_interrupt():
+                            proc.terminate()
+                            print(" \033[1;33m[🛑 Interrupted]\033[0m")
+                            break
+                        time.sleep(0.05)
                 except Exception:
                     pass
-            return
-            
-        # Fallback to espeak-ng
-        elif shutil.which("espeak-ng"):
-            self.is_speaking = True
-            try:
-                speed_param = str(int(175 * speed))  # Default espeak speed is 175
-                proc = subprocess.Popen(["espeak-ng", "-s", speed_param, text])
-                while proc.poll() is None:
-                    if interrupt_check and interrupt_check():
-                        proc.terminate()
-                        break
-                    time.sleep(0.05)
-            except Exception:
-                pass
-            self.is_speaking = False
-            return
-            
-        # Last resort: print
-        print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {text}")
+                return
+                
+            # Last resort: print
+            else:
+                print(f"\n\033[1;35m[WavesAI]\033[0m ➜ {text}")
+        
+        finally:
+            # Always stop speaking state to resume listening
+            self.stop_speaking()
     
     def voice_mode(self):
         """New voice mode using sounddevice like the working prototype"""
@@ -965,6 +1082,10 @@ class WavesAI:
         self.stop_listening = False
         
         def audio_callback(indata, frames, time_info, status):
+            # Skip audio input if echo prevention is active
+            if hasattr(self, 'should_ignore_audio') and self.should_ignore_audio():
+                return  # Don't queue audio during AI speech or post-speech delay
+                
             if not vad.is_calibrated:
                 vad.calibrate(indata)
             audio_queue.put(indata.copy())
@@ -1077,17 +1198,32 @@ class WavesAI:
                         print(" ✓")
                         print(f"\n\033[1;36m[You]\033[0m {text}")
                         
-                        # Check for exit
-                        if text.lower() in ['exit', 'quit', 'goodbye', 'bye', 'stop']:
+                        # Check for stop commands first
+                        if hasattr(self, 'detect_stop_command') and self.detect_stop_command(text):
+                            if self.conversation_state.get('is_speaking', False):
+                                print("\033[1;33m[🛑 Stopping AI speech...]\033[0m")
+                                self.request_interrupt()
+                                continue
+                            else:
+                                print("\033[1;35m[WavesAI]\033[0m I'll be quiet now.")
+                                continue
+                        
+                        # Check for exit commands  
+                        if text.lower() in ['exit', 'quit', 'goodbye', 'bye']:
                             print("\033[1;35m[WavesAI]\033[0m Goodbye!")
                             self.stop_listening = True
                             break
+                        
+                        # Skip processing if we should ignore audio (echo prevention)
+                        if hasattr(self, 'should_ignore_audio') and self.should_ignore_audio():
+                            print(" \033[1;33m[🔇 Echo prevention - ignoring]\033[0m")
+                            continue
                         
                         # Process with AI
                         response = self.generate_response(text)
                         print(f"\033[1;35m[WavesAI]\033[0m {response}")
                         
-                        # TTS if available
+                        # TTS if available (with echo prevention)
                         if hasattr(self, 'tts_speak_advanced'):
                             self.tts_speak_advanced(response[:500])
                     else:
