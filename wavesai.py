@@ -587,6 +587,20 @@ class WavesAI:
                 'noise_reduction_strength': 0.5,
                 'spectral_profile': None
             }
+
+        # Initialize Acoustic Echo Cancellation (AEC) for interrupt feature
+        if not hasattr(self, 'aec_system'):
+            self.aec_system = {
+                'enabled': True,  # Enable interrupt feature
+                'ai_voice_reference': deque(maxlen=200),  # Store AI's voice output for echo cancellation
+                'echo_threshold': 0.7,  # Similarity threshold for echo detection
+                'interrupt_energy_threshold': 0.05,  # Minimum energy to consider as user interrupt
+                'interrupt_duration_threshold': 0.3,  # Minimum duration for valid interrupt (seconds)
+                'speaking_pattern': None,  # AI's current speaking pattern
+                'last_output_time': 0,
+                'interrupt_cooldown': 0.5,  # Cooldown after TTS starts
+                'user_voice_profile': deque(maxlen=50)  # Learn user's voice characteristics
+            }
     
     def analyze_background_noise(self, audio_chunk: np.ndarray, sample_rate: int) -> dict:
         """Analyze background noise characteristics for smart cancellation"""
@@ -730,7 +744,103 @@ class WavesAI:
         if max_val > 0:
             return audio_data * (0.95 / max_val)
         return audio_data
-    
+
+    def is_ai_echo(self, audio_chunk: np.ndarray, sample_rate: int) -> tuple:
+        """
+        Detect if audio is AI's own voice (echo) or user's voice (interrupt).
+        Returns: (is_echo: bool, confidence: float, is_interrupt: bool)
+        """
+        try:
+            # Initialize AEC if needed
+            if not hasattr(self, 'aec_system'):
+                self.init_smart_noise_detection()
+
+            # If interrupt feature is disabled, treat all as echo
+            if not self.aec_system.get('enabled', False):
+                return True, 1.0, False
+
+            # Calculate audio energy
+            energy = np.sqrt(np.mean(audio_chunk.flatten() ** 2))
+
+            # Check if AI is currently speaking
+            if not self.conversation_state.get('is_speaking', False):
+                # AI not speaking, so this is definitely user input
+                return False, 0.0, False
+
+            # Energy-based filtering (very low energy = likely noise)
+            if energy < self.aec_system.get('interrupt_energy_threshold', 0.05):
+                return True, 0.9, False  # Too quiet, treat as echo/noise
+
+            # Time-based filtering (cooldown period)
+            current_time = time.time()
+            time_since_speaking = current_time - self.aec_system.get('last_output_time', 0)
+            if time_since_speaking < self.aec_system.get('interrupt_cooldown', 0.5):
+                return True, 0.95, False  # Within cooldown, treat as echo
+
+            # Spectral analysis - compare with AI voice reference
+            if len(self.aec_system['ai_voice_reference']) > 0:
+                # Calculate spectral features of current audio
+                try:
+                    if len(audio_chunk) >= 512:
+                        fft_current = np.fft.rfft(audio_chunk.flatten())
+                        magnitude_current = np.abs(fft_current)
+
+                        # Get recent AI voice reference
+                        reference_samples = list(self.aec_system['ai_voice_reference'])[-5:]
+                        if reference_samples:
+                            # Calculate average reference spectrum
+                            reference_spectrum = np.mean([np.abs(np.fft.rfft(ref))
+                                                         for ref in reference_samples if len(ref) >= 512], axis=0)
+
+                            # Normalize both spectra
+                            if len(magnitude_current) == len(reference_spectrum):
+                                magnitude_current_norm = magnitude_current / (np.max(magnitude_current) + 1e-10)
+                                reference_spectrum_norm = reference_spectrum / (np.max(reference_spectrum) + 1e-10)
+
+                                # Calculate spectral similarity (correlation)
+                                similarity = np.corrcoef(magnitude_current_norm[:min(len(magnitude_current_norm),
+                                                                                     len(reference_spectrum_norm))],
+                                                        reference_spectrum_norm[:min(len(magnitude_current_norm),
+                                                                                    len(reference_spectrum_norm))])[0, 1]
+
+                                # High similarity = likely echo
+                                if similarity > self.aec_system.get('echo_threshold', 0.7):
+                                    return True, float(similarity), False
+
+                                # Low similarity + high energy = likely user interrupt
+                                if similarity < 0.5 and energy > 0.08:
+                                    return False, 1.0 - float(similarity), True
+
+                except Exception:
+                    pass
+
+            # Pattern-based detection: Compare temporal patterns
+            # If energy is significantly higher than AI's speaking level, likely user interrupt
+            if hasattr(self, 'current_tts_energy'):
+                if energy > self.current_tts_energy * 1.5:
+                    # Much louder than AI = user speaking
+                    return False, 0.8, True
+
+            # Default: High energy during AI speech = potential interrupt
+            if energy > 0.1:
+                return False, 0.6, True
+
+            # Low confidence, treat as echo by default
+            return True, 0.5, False
+
+        except Exception as e:
+            # On error, treat as echo to avoid false interrupts
+            return True, 0.9, False
+
+    def store_ai_voice_reference(self, audio_chunk: np.ndarray):
+        """Store AI's voice output as reference for echo cancellation"""
+        try:
+            if hasattr(self, 'aec_system') and self.aec_system.get('enabled', False):
+                # Store flattened audio chunk
+                self.aec_system['ai_voice_reference'].append(audio_chunk.flatten())
+        except Exception:
+            pass
+
     def detect_stop_command(self, text: str) -> bool:
         """Detect if user wants to stop/interrupt the AI"""
         if not self.voice_config.get('enable_stop_commands', True):
@@ -755,18 +865,35 @@ class WavesAI:
     def should_ignore_audio(self) -> bool:
         """Determine if audio input should be ignored to prevent feedback"""
         current_time = time.time()
-        
-        # Always ignore if AI is currently speaking
+
+        # Check if interrupt feature is enabled
+        if hasattr(self, 'aec_system') and self.aec_system.get('enabled', False):
+            # Interrupt feature enabled - use AEC instead of muting
+            # Only ignore during initial cooldown period after TTS starts
+            if self.conversation_state['is_speaking']:
+                time_since_speaking_start = current_time - self.aec_system.get('last_output_time', 0)
+                cooldown = self.aec_system.get('interrupt_cooldown', 0.5)
+                if time_since_speaking_start < cooldown:
+                    return True  # Brief cooldown to prevent immediate self-interruption
+                return False  # Allow audio during TTS for interrupt detection
+
+            # Minimal post-speech delay when interrupt is enabled
+            time_since_speech = current_time - self.conversation_state['last_speech_end']
+            if time_since_speech < 0.3:  # Short delay
+                return True
+            return False
+
+        # Original echo prevention logic when interrupt is disabled
         if self.conversation_state['is_speaking']:
             return True
-            
+
         # Ignore during post-speech delay period
         time_since_speech = current_time - self.conversation_state['last_speech_end']
         post_delay = self.voice_config.get('post_speech_delay', 2.0)
-        
+
         if time_since_speech < post_delay:
             return True
-            
+
         # Check echo prevention level
         echo_mode = self.voice_config.get('echo_prevention', 'aggressive')
         if echo_mode == 'off':
@@ -775,7 +902,7 @@ class WavesAI:
             return True
         elif echo_mode in ['moderate', 'aggressive'] and time_since_speech < post_delay:
             return True
-            
+
         return False
     
     def start_speaking(self):
@@ -784,6 +911,11 @@ class WavesAI:
         self.conversation_state['is_listening'] = False
         self.conversation_state['interrupt_requested'] = False
         self.is_speaking = True  # Legacy compatibility
+
+        # Update AEC system
+        if hasattr(self, 'aec_system'):
+            self.aec_system['last_output_time'] = time.time()
+            self.aec_system['ai_voice_reference'].clear()  # Clear old reference
         
     def stop_speaking(self):
         """Mark the end of AI speech output and start post-speech delay"""
@@ -1082,10 +1214,23 @@ class WavesAI:
         self.stop_listening = False
         
         def audio_callback(indata, frames, time_info, status):
-            # Skip audio input if echo prevention is active
+            # Check echo prevention / interrupt feature
             if hasattr(self, 'should_ignore_audio') and self.should_ignore_audio():
-                return  # Don't queue audio during AI speech or post-speech delay
-                
+                return  # Don't queue audio during cooldown period
+
+            # If interrupt feature is enabled and AI is speaking, check for echo
+            if (hasattr(self, 'aec_system') and self.aec_system.get('enabled', False) and
+                self.conversation_state.get('is_speaking', False)):
+                # Use AEC to detect if this is echo or user interrupt
+                is_echo, confidence, is_interrupt = self.is_ai_echo(indata, sample_rate)
+                if is_echo:
+                    return  # Ignore echo from speakers
+
+                # If user is interrupting, mark it
+                if is_interrupt:
+                    self.conversation_state['interrupt_requested'] = True
+                    self.conversation_state['user_interrupted'] = True
+
             if not vad.is_calibrated:
                 vad.calibrate(indata)
             audio_queue.put(indata.copy())
@@ -1122,20 +1267,35 @@ class WavesAI:
                     try:
                         audio_chunk = audio_queue.get(timeout=0.1)
                     except queue.Empty:
+                        # Check if interrupt was requested while waiting
+                        if self.conversation_state.get('interrupt_requested', False):
+                            print("\n\033[1;33m[🛑 User interrupted AI]\033[0m")
+                            self.conversation_state['interrupt_requested'] = False
+                            # Reset recording state
+                            is_recording = False
+                            recording_buffer = []
                         continue
-                    
+
                     voice_detected, energy = vad.is_voice_detected(audio_chunk)
-                    
+
                     if voice_detected and not is_recording:
+                        # Check if this might be during AI speech (interrupt scenario)
+                        if self.conversation_state.get('is_speaking', False):
+                            # User is trying to speak during AI response
+                            print(f"\n\033[1;33m[⚠️  Interrupt Detected]\033[0m Energy: {energy:.4f}")
+                            self.request_interrupt()
+                            # Wait briefly for TTS to stop
+                            time.sleep(0.2)
+
                         print(f"\n\033[1;33m[🎤 Recording]\033[0m Energy: {energy:.4f}", end='', flush=True)
                         is_recording = True
                         recording_start = time.time()
                         recording_buffer = []
                         silence_start = None
-                    
+
                     if is_recording:
                         recording_buffer.append(audio_chunk)
-                        
+
                         if not voice_detected:
                             if silence_start is None:
                                 silence_start = time.time()
