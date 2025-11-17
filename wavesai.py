@@ -59,10 +59,19 @@ try:
 except ImportError:
     nr = None
 
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
+
 # Import WavesAI modules
 from modules.search_engine import SearchEngine
 from modules.system_monitor import SystemMonitor
 from modules.command_handler import CommandHandler
+try:
+    from modules.echo_cancellation import WavesAIEchoCancellation
+except Exception:
+    WavesAIEchoCancellation = None
 
 # Configuration - Load from config file
 def load_config():
@@ -115,6 +124,13 @@ class WavesAI:
         
         self.system_context = self.system_monitor.get_system_context()
         self.system_prompt_template = self.load_system_prompt()
+        
+        # Auto-detect device type and persist to config
+        try:
+            self.device_type = self.detect_device_type()
+            self.persist_device_type_to_config(self.device_type)
+        except Exception:
+            self.device_type = 'unknown'
         
         # Define dangerous command patterns
         self.dangerous_patterns = [
@@ -505,7 +521,15 @@ class WavesAI:
             'post_speech_delay': float(os.getenv('WAVESAI_POST_SPEECH_DELAY', '2.0')),
             'interrupt_sensitivity': os.getenv('WAVESAI_INTERRUPT_SENSITIVITY', 'medium').lower(),
             'enable_stop_commands': os.getenv('WAVESAI_ENABLE_STOP_COMMANDS', 'true').lower() == 'true',
-            'stop_words': ['stop', 'quiet', 'pause', 'silence', 'shut up', 'enough']
+            'stop_words': ['stop', 'quiet', 'pause', 'silence', 'shut up', 'enough'],
+            'fast_interrupt_enabled': os.getenv('WAVESAI_FAST_INTERRUPT', 'true').lower() == 'true',
+            'fast_interrupt_rms': float(os.getenv('WAVESAI_FAST_INTERRUPT_RMS', '0.02')),
+            'simple_interrupt': os.getenv('WAVESAI_SIMPLE_INTERRUPT', 'true').lower() == 'true',
+            'simple_intr_frames': int(os.getenv('WAVESAI_SIMPLE_INTR_FRAMES', '2')),
+            'intr_baseline_mult': float(os.getenv('WAVESAI_INTR_BASELINE_MULT', '1.25')),
+            'intr_abs_margin': float(os.getenv('WAVESAI_INTR_ABS_MARGIN', '0.005')),
+            'intr_bypass_mult': float(os.getenv('WAVESAI_INTR_BYPASS_MULT', '1.8')),
+            'intr_abs_high': float(os.getenv('WAVESAI_INTR_ABS_HIGH', '0.06'))
         }
         
         # Audio processing queues
@@ -520,12 +544,24 @@ class WavesAI:
             'interrupt_requested': False,
             'user_interrupted': False,
             'silence_start': None,
-            'post_speech_timer': 0
+            'post_speech_timer': 0,
+            'is_processing': False
         }
         
         # Legacy compatibility
         self.is_speaking = False
         self.stop_listening = False
+        if WavesAIEchoCancellation is not None and not hasattr(self, 'echo_cancel'):
+            try:
+                self.echo_cancel = WavesAIEchoCancellation(method=os.getenv('WAVESAI_ECHO_METHOD', 'smart'))
+            except Exception:
+                pass
+        # Cooperative cancellation state
+        if not hasattr(self, '_processing_abort_event'):
+            self._processing_abort_event = threading.Event()
+        # Generation-based cancellation (monotonic counter)
+        if not hasattr(self, '_processing_generation'):
+            self._processing_generation = 0
         
     def get_detailed_system_info(self) -> str:
         """Get detailed system information for monitoring"""
@@ -586,20 +622,6 @@ class WavesAI:
                 'last_calibration': 0,
                 'noise_reduction_strength': 0.5,
                 'spectral_profile': None
-            }
-
-        # Initialize Acoustic Echo Cancellation (AEC) for interrupt feature
-        if not hasattr(self, 'aec_system'):
-            self.aec_system = {
-                'enabled': True,  # Enable interrupt feature
-                'ai_voice_reference': deque(maxlen=200),  # Store AI's voice output for echo cancellation
-                'echo_threshold': 0.7,  # Similarity threshold for echo detection
-                'interrupt_energy_threshold': 0.05,  # Minimum energy to consider as user interrupt
-                'interrupt_duration_threshold': 0.3,  # Minimum duration for valid interrupt (seconds)
-                'speaking_pattern': None,  # AI's current speaking pattern
-                'last_output_time': 0,
-                'interrupt_cooldown': 0.5,  # Cooldown after TTS starts
-                'user_voice_profile': deque(maxlen=50)  # Learn user's voice characteristics
             }
     
     def analyze_background_noise(self, audio_chunk: np.ndarray, sample_rate: int) -> dict:
@@ -744,103 +766,7 @@ class WavesAI:
         if max_val > 0:
             return audio_data * (0.95 / max_val)
         return audio_data
-
-    def is_ai_echo(self, audio_chunk: np.ndarray, sample_rate: int) -> tuple:
-        """
-        Detect if audio is AI's own voice (echo) or user's voice (interrupt).
-        Returns: (is_echo: bool, confidence: float, is_interrupt: bool)
-        """
-        try:
-            # Initialize AEC if needed
-            if not hasattr(self, 'aec_system'):
-                self.init_smart_noise_detection()
-
-            # If interrupt feature is disabled, treat all as echo
-            if not self.aec_system.get('enabled', False):
-                return True, 1.0, False
-
-            # Calculate audio energy
-            energy = np.sqrt(np.mean(audio_chunk.flatten() ** 2))
-
-            # Check if AI is currently speaking
-            if not self.conversation_state.get('is_speaking', False):
-                # AI not speaking, so this is definitely user input
-                return False, 0.0, False
-
-            # Energy-based filtering (very low energy = likely noise)
-            if energy < self.aec_system.get('interrupt_energy_threshold', 0.05):
-                return True, 0.9, False  # Too quiet, treat as echo/noise
-
-            # Time-based filtering (cooldown period)
-            current_time = time.time()
-            time_since_speaking = current_time - self.aec_system.get('last_output_time', 0)
-            if time_since_speaking < self.aec_system.get('interrupt_cooldown', 0.5):
-                return True, 0.95, False  # Within cooldown, treat as echo
-
-            # Spectral analysis - compare with AI voice reference
-            if len(self.aec_system['ai_voice_reference']) > 0:
-                # Calculate spectral features of current audio
-                try:
-                    if len(audio_chunk) >= 512:
-                        fft_current = np.fft.rfft(audio_chunk.flatten())
-                        magnitude_current = np.abs(fft_current)
-
-                        # Get recent AI voice reference
-                        reference_samples = list(self.aec_system['ai_voice_reference'])[-5:]
-                        if reference_samples:
-                            # Calculate average reference spectrum
-                            reference_spectrum = np.mean([np.abs(np.fft.rfft(ref))
-                                                         for ref in reference_samples if len(ref) >= 512], axis=0)
-
-                            # Normalize both spectra
-                            if len(magnitude_current) == len(reference_spectrum):
-                                magnitude_current_norm = magnitude_current / (np.max(magnitude_current) + 1e-10)
-                                reference_spectrum_norm = reference_spectrum / (np.max(reference_spectrum) + 1e-10)
-
-                                # Calculate spectral similarity (correlation)
-                                similarity = np.corrcoef(magnitude_current_norm[:min(len(magnitude_current_norm),
-                                                                                     len(reference_spectrum_norm))],
-                                                        reference_spectrum_norm[:min(len(magnitude_current_norm),
-                                                                                    len(reference_spectrum_norm))])[0, 1]
-
-                                # High similarity = likely echo
-                                if similarity > self.aec_system.get('echo_threshold', 0.7):
-                                    return True, float(similarity), False
-
-                                # Low similarity + high energy = likely user interrupt
-                                if similarity < 0.5 and energy > 0.08:
-                                    return False, 1.0 - float(similarity), True
-
-                except Exception:
-                    pass
-
-            # Pattern-based detection: Compare temporal patterns
-            # If energy is significantly higher than AI's speaking level, likely user interrupt
-            if hasattr(self, 'current_tts_energy'):
-                if energy > self.current_tts_energy * 1.5:
-                    # Much louder than AI = user speaking
-                    return False, 0.8, True
-
-            # Default: High energy during AI speech = potential interrupt
-            if energy > 0.1:
-                return False, 0.6, True
-
-            # Low confidence, treat as echo by default
-            return True, 0.5, False
-
-        except Exception as e:
-            # On error, treat as echo to avoid false interrupts
-            return True, 0.9, False
-
-    def store_ai_voice_reference(self, audio_chunk: np.ndarray):
-        """Store AI's voice output as reference for echo cancellation"""
-        try:
-            if hasattr(self, 'aec_system') and self.aec_system.get('enabled', False):
-                # Store flattened audio chunk
-                self.aec_system['ai_voice_reference'].append(audio_chunk.flatten())
-        except Exception:
-            pass
-
+    
     def detect_stop_command(self, text: str) -> bool:
         """Detect if user wants to stop/interrupt the AI"""
         if not self.voice_config.get('enable_stop_commands', True):
@@ -865,35 +791,18 @@ class WavesAI:
     def should_ignore_audio(self) -> bool:
         """Determine if audio input should be ignored to prevent feedback"""
         current_time = time.time()
-
-        # Check if interrupt feature is enabled
-        if hasattr(self, 'aec_system') and self.aec_system.get('enabled', False):
-            # Interrupt feature enabled - use AEC instead of muting
-            # Only ignore during initial cooldown period after TTS starts
-            if self.conversation_state['is_speaking']:
-                time_since_speaking_start = current_time - self.aec_system.get('last_output_time', 0)
-                cooldown = self.aec_system.get('interrupt_cooldown', 0.5)
-                if time_since_speaking_start < cooldown:
-                    return True  # Brief cooldown to prevent immediate self-interruption
-                return False  # Allow audio during TTS for interrupt detection
-
-            # Minimal post-speech delay when interrupt is enabled
-            time_since_speech = current_time - self.conversation_state['last_speech_end']
-            if time_since_speech < 0.3:  # Short delay
-                return True
-            return False
-
-        # Original echo prevention logic when interrupt is disabled
+        
+        # Always ignore if AI is currently speaking
         if self.conversation_state['is_speaking']:
             return True
-
+            
         # Ignore during post-speech delay period
         time_since_speech = current_time - self.conversation_state['last_speech_end']
         post_delay = self.voice_config.get('post_speech_delay', 2.0)
-
+        
         if time_since_speech < post_delay:
             return True
-
+            
         # Check echo prevention level
         echo_mode = self.voice_config.get('echo_prevention', 'aggressive')
         if echo_mode == 'off':
@@ -902,7 +811,7 @@ class WavesAI:
             return True
         elif echo_mode in ['moderate', 'aggressive'] and time_since_speech < post_delay:
             return True
-
+            
         return False
     
     def start_speaking(self):
@@ -911,11 +820,6 @@ class WavesAI:
         self.conversation_state['is_listening'] = False
         self.conversation_state['interrupt_requested'] = False
         self.is_speaking = True  # Legacy compatibility
-
-        # Update AEC system
-        if hasattr(self, 'aec_system'):
-            self.aec_system['last_output_time'] = time.time()
-            self.aec_system['ai_voice_reference'].clear()  # Clear old reference
         
     def stop_speaking(self):
         """Mark the end of AI speech output and start post-speech delay"""
@@ -940,10 +844,237 @@ class WavesAI:
         """Request immediate interruption of AI speech"""
         self.conversation_state['interrupt_requested'] = True
         self.conversation_state['user_interrupted'] = True
+        try:
+            self._processing_abort_event.set()
+        except Exception:
+            pass
+        # Bump generation so ongoing work can detect cancellation without blocking new pipeline
+        try:
+            self._processing_generation += 1
+        except Exception:
+            self._processing_generation = 1
         
     def check_interrupt(self) -> bool:
         """Check if speech should be interrupted"""
-        return self.conversation_state['interrupt_requested'] or self.stop_listening
+        try:
+            aborting = hasattr(self, '_processing_abort_event') and self._processing_abort_event.is_set()
+        except Exception:
+            aborting = False
+        return self.conversation_state['interrupt_requested'] or self.stop_listening or aborting
+
+    def clear_interrupts(self):
+        """Clear interrupt flags when starting a new user utterance"""
+        try:
+            self.conversation_state['interrupt_requested'] = False
+            if hasattr(self, '_processing_abort_event'):
+                self._processing_abort_event.clear()
+        except Exception:
+            pass
+
+    def is_canceled(self, generation: int) -> bool:
+        """Return True if the given generation has been superseded by an interrupt"""
+        try:
+            return getattr(self, '_processing_generation', 0) != generation
+        except Exception:
+            return False
+    
+    def _start_fast_interrupt_listener(self):
+        if not hasattr(self, 'voice_config'):
+            self.init_voice_components()
+        if not self.voice_config.get('fast_interrupt_enabled', True):
+            return
+        if getattr(self, '_fast_intr_active', False):
+            return
+        # If voice mode's own input stream is active, we rely on its callback for fast interrupt
+        if getattr(self, '_voice_mode_stream_active', False):
+            return
+        self._fast_intr_active = True
+        self._fast_intr_stop = threading.Event()
+        threshold = float(self.voice_config.get('fast_interrupt_rms', 0.008))
+        self._fast_intr_stream = None
+        self._fast_intr_thread = None
+        if sd is not None and np is not None:
+            def _cb(indata, frames, time_info, status):
+                try:
+                    # Prepare raw and noise-reduced versions
+                    x_raw = indata[:, 0] if indata.ndim > 1 else indata
+                    x_raw = x_raw.astype(np.float32) if x_raw is not None else np.zeros(0, dtype=np.float32)
+                    x_raw = np.nan_to_num(x_raw, nan=0.0, posinf=0.0, neginf=0.0)
+                    x = x_raw.copy()
+                    # Reduce noise for RMS stability (do NOT reduce for canceller input)
+                    try:
+                        if hasattr(self, 'apply_noise_reduction') and (
+                            self.voice_config.get('enable_noise_reduction') or self.voice_config.get('smart_noise_cancellation', True)
+                        ):
+                            x = self.apply_noise_reduction(x, 16000)
+                    except Exception:
+                        pass
+                    # Lightweight baseline calibration for fast listener
+                    self._fast_intr_calib = getattr(self, '_fast_intr_calib', [])
+                    if len(self._fast_intr_calib) < 10 and x.size > 0:
+                        try:
+                            self._fast_intr_calib.append(float(np.sqrt(np.mean(np.square(x)))))
+                        except Exception:
+                            pass
+                    if len(getattr(self, '_fast_intr_calib', [])) >= 10 and not getattr(self, '_fast_intr_has_floor', False):
+                        try:
+                            self._fast_intr_noise_floor = float(np.mean(self._fast_intr_calib)) * 1.5
+                            self._fast_intr_has_floor = True
+                        except Exception:
+                            self._fast_intr_noise_floor = 0.0
+                            self._fast_intr_has_floor = False
+                    baseline = getattr(self, '_fast_intr_noise_floor', 0.0)
+                    rms_raw = float(np.sqrt(np.mean(np.square(x_raw)))) if x_raw.size > 0 else 0.0
+                    rms_nr = float(np.sqrt(np.mean(np.square(x)))) if x.size > 0 else 0.0
+                    rms = rms_raw if rms_raw >= rms_nr else rms_nr
+                except Exception:
+                    rms = 0.0
+                # Unified effective threshold and consecutive frames
+                try:
+                    baseline_mult = float(self.voice_config.get('intr_baseline_mult', 1.25))
+                    abs_margin = float(self.voice_config.get('intr_abs_margin', 0.005))
+                    eff_thr = max(threshold, baseline_mult * float(baseline) + abs_margin)
+                except Exception:
+                    eff_thr = threshold
+                frames_needed = int(self.voice_config.get('simple_intr_frames', 3))
+                self._fast_intr_count = getattr(self, '_fast_intr_count', 0)
+                # Use echo canceller gating when available and not in simple mode
+                allow = True
+                if hasattr(self, 'echo_cancel') and not self.voice_config.get('simple_interrupt', True):
+                    try:
+                        allow = bool(self.echo_cancel.should_allow_interrupt(x_raw))
+                    except Exception:
+                        allow = False
+                # Bypass canceller if user's RMS is very strong
+                try:
+                    bypass_mult = float(self.voice_config.get('intr_bypass_mult', 1.8))
+                    abs_high = float(self.voice_config.get('intr_abs_high', 0.06))
+                except Exception:
+                    bypass_mult, abs_high = 1.8, 0.06
+                bypass = (rms >= eff_thr * bypass_mult) or (rms >= abs_high)
+                if (allow and rms >= eff_thr) or bypass:
+                    self._fast_intr_count += 1
+                else:
+                    self._fast_intr_count = 0
+                if self._fast_intr_count >= frames_needed:
+                    self._fast_intr_count = 0
+                    self.request_interrupt()
+            try:
+                self._fast_intr_stream = sd.InputStream(channels=1, samplerate=16000, dtype='float32', blocksize=256, callback=_cb)
+                self._fast_intr_stream.start()
+                return
+            except Exception:
+                self._fast_intr_stream = None
+        if pyaudio is not None and np is not None:
+            def _worker():
+                pa = None
+                try:
+                    pa = pyaudio.PyAudio()
+                    stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=256)
+                    fast_calib = []
+                    fast_has_floor = False
+                    fast_floor = 0.0
+                    frames_needed = int(self.voice_config.get('simple_intr_frames', 3))
+                    local_count = 0
+                    thr = threshold
+                    while not self._fast_intr_stop.is_set():
+                        try:
+                            data = stream.read(256, exception_on_overflow=False)
+                            audio_raw = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                            audio_raw = np.nan_to_num(audio_raw, nan=0.0, posinf=0.0, neginf=0.0)
+                            audio = audio_raw.copy()
+                            try:
+                                if hasattr(self, 'apply_noise_reduction') and (
+                                    self.voice_config.get('enable_noise_reduction') or self.voice_config.get('smart_noise_cancellation', True)
+                                ):
+                                    audio = self.apply_noise_reduction(audio, 16000)
+                            except Exception:
+                                pass
+                            if audio.size == 0:
+                                continue
+                            rms_raw = float(np.sqrt(np.mean(np.square(audio_raw))))
+                            rms_nr = float(np.sqrt(np.mean(np.square(audio))))
+                            rms = rms_raw if rms_raw >= rms_nr else rms_nr
+                            if len(fast_calib) < 10:
+                                fast_calib.append(rms)
+                            elif not fast_has_floor:
+                                try:
+                                    fast_floor = float(np.mean(fast_calib)) * 1.5
+                                    fast_has_floor = True
+                                except Exception:
+                                    fast_floor = 0.0
+                                    fast_has_floor = False
+                            try:
+                                baseline_mult = float(self.voice_config.get('intr_baseline_mult', 1.25))
+                                abs_margin = float(self.voice_config.get('intr_abs_margin', 0.005))
+                                eff_thr = max(thr, baseline_mult * float(fast_floor) + abs_margin)
+                            except Exception:
+                                eff_thr = thr
+                            # Apply echo canceller gating when available and not in simple mode
+                            allow = True
+                            if hasattr(self, 'echo_cancel') and not self.voice_config.get('simple_interrupt', True):
+                                try:
+                                    allow = bool(self.echo_cancel.should_allow_interrupt(audio_raw))
+                                except Exception:
+                                    allow = False
+                            try:
+                                bypass_mult = float(self.voice_config.get('intr_bypass_mult', 1.8))
+                                abs_high = float(self.voice_config.get('intr_abs_high', 0.06))
+                            except Exception:
+                                bypass_mult, abs_high = 1.8, 0.06
+                            bypass = (rms >= eff_thr * bypass_mult) or (rms >= abs_high)
+                            if (allow and rms >= eff_thr) or bypass:
+                                local_count += 1
+                            else:
+                                local_count = 0
+                            if local_count >= frames_needed:
+                                self.request_interrupt()
+                                break
+                        except Exception:
+                            break
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        if pa is not None:
+                            pa.terminate()
+                    except Exception:
+                        pass
+                    self._fast_intr_thread = None
+            t = threading.Thread(target=_worker, daemon=True)
+            self._fast_intr_thread = t
+            t.start()
+        else:
+            self._fast_intr_active = False
+    
+    def _stop_fast_interrupt_listener(self):
+        try:
+            if hasattr(self, '_fast_intr_stop') and self._fast_intr_stop is not None:
+                self._fast_intr_stop.set()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_fast_intr_stream') and self._fast_intr_stream is not None:
+                try:
+                    self._fast_intr_stream.stop()
+                    self._fast_intr_stream.close()
+                except Exception:
+                    pass
+                self._fast_intr_stream = None
+        except Exception:
+            pass
+        try:
+            t = getattr(self, '_fast_intr_thread', None)
+            if t and t.is_alive():
+                t.join(timeout=0.2)
+        except Exception:
+            pass
+        self._fast_intr_active = False
     
     def tts_speak_advanced(self, text: str, interrupt_check=None):
         """Advanced TTS with echo prevention and interruption support"""
@@ -968,8 +1099,13 @@ class WavesAI:
         if not text:
             return
             
-        # Start speaking state - this prevents audio input
-        self.start_speaking()
+        started_speaking = False
+        guard_ms = int(os.getenv('WAVESAI_INTERRUPT_GUARD_MS', '200'))
+        try:
+            if self.voice_config.get('simple_interrupt', True) or hasattr(self, 'echo_cancel'):
+                guard_ms = 0
+        except Exception:
+            pass
         
         try:
             model = self.voice_config.get('piper_model')
@@ -986,21 +1122,50 @@ class WavesAI:
                         cmd.extend(["--length_scale", str(1.0/speed)])
                     
                     subprocess.run(cmd + ["--text", text], check=True, capture_output=True)
+                    try:
+                        with wave.open(out, 'rb') as wf:
+                            n_channels = wf.getnchannels()
+                            n_frames = wf.getnframes()
+                            sampwidth = wf.getsampwidth()
+                            frames = wf.readframes(n_frames)
+                        if np is not None and sampwidth == 2 and n_frames > 0:
+                            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                            if n_channels and n_channels > 1:
+                                audio = audio.reshape(-1, n_channels).mean(axis=1)
+                            if hasattr(self, 'echo_cancel'):
+                                try:
+                                    self.echo_cancel.on_tts_start(audio)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     
                     # Play with enhanced interruption support
+                    guard_s = guard_ms / 1000.0
                     if shutil.which("aplay"):
+                        if not started_speaking:
+                            self.start_speaking()
+                            self._start_fast_interrupt_listener()
+                            started_speaking = True
+                        self._tts_guard_until = time.time() + guard_s
                         proc = subprocess.Popen(["aplay", "-q", out])
                         while proc.poll() is None:
-                            # Check multiple interrupt conditions
-                            if (interrupt_check and interrupt_check()) or self.check_interrupt():
+                            now = time.time()
+                            if now >= getattr(self, '_tts_guard_until', 0) and ((interrupt_check and interrupt_check()) or self.check_interrupt()):
                                 proc.terminate()
                                 print(" \033[1;33m[🛑 Interrupted]\033[0m")
                                 break
                             time.sleep(0.05)
                     elif shutil.which("ffplay"):
+                        if not started_speaking:
+                            self.start_speaking()
+                            self._start_fast_interrupt_listener()
+                            started_speaking = True
+                        self._tts_guard_until = time.time() + guard_s
                         proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", out])
                         while proc.poll() is None:
-                            if (interrupt_check and interrupt_check()) or self.check_interrupt():
+                            now = time.time()
+                            if now >= getattr(self, '_tts_guard_until', 0) and ((interrupt_check and interrupt_check()) or self.check_interrupt()):
                                 proc.terminate()
                                 print(" \033[1;33m[🛑 Interrupted]\033[0m")
                                 break
@@ -1017,14 +1182,64 @@ class WavesAI:
             # Fallback to espeak-ng  
             elif shutil.which("espeak-ng"):
                 try:
-                    speed_param = str(int(175 * speed))  # Default espeak speed is 175
-                    proc = subprocess.Popen(["espeak-ng", "-s", speed_param, text])
-                    while proc.poll() is None:
-                        if (interrupt_check and interrupt_check()) or self.check_interrupt():
-                            proc.terminate()
-                            print(" \033[1;33m[🛑 Interrupted]\033[0m")
-                            break
-                        time.sleep(0.05)
+                    speed_param = str(int(175 * speed))
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        out = tmp.name
+                    try:
+                        subprocess.run(["espeak-ng", "-s", speed_param, "-w", out, text], check=True, capture_output=True)
+                        try:
+                            with wave.open(out, 'rb') as wf:
+                                n_channels = wf.getnchannels()
+                                n_frames = wf.getnframes()
+                                sampwidth = wf.getsampwidth()
+                                frames = wf.readframes(n_frames)
+                            if np is not None and sampwidth == 2 and n_frames > 0:
+                                audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                                if n_channels and n_channels > 1:
+                                    audio = audio.reshape(-1, n_channels).mean(axis=1)
+                                if hasattr(self, 'echo_cancel'):
+                                    try:
+                                        self.echo_cancel.on_tts_start(audio)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        guard_s = guard_ms / 1000.0
+                        if shutil.which("aplay"):
+                            if not started_speaking:
+                                self.start_speaking()
+                                self._start_fast_interrupt_listener()
+                                started_speaking = True
+                            self._tts_guard_until = time.time() + guard_s
+                            proc = subprocess.Popen(["aplay", "-q", out])
+                            while proc.poll() is None:
+                                now = time.time()
+                                if now >= getattr(self, '_tts_guard_until', 0) and ((interrupt_check and interrupt_check()) or self.check_interrupt()):
+                                    proc.terminate()
+                                    print(" \033[1;33m[🛑 Interrupted]\033[0m")
+                                    break
+                                time.sleep(0.05)
+                        elif shutil.which("ffplay"):
+                            if not started_speaking:
+                                self.start_speaking()
+                                self._start_fast_interrupt_listener()
+                                started_speaking = True
+                            self._tts_guard_until = time.time() + guard_s
+                            proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", out])
+                            while proc.poll() is None:
+                                now = time.time()
+                                if now >= getattr(self, '_tts_guard_until', 0) and ((interrupt_check and interrupt_check()) or self.check_interrupt()):
+                                    proc.terminate()
+                                    print(" \033[1;33m[🛑 Interrupted]\033[0m")
+                                    break
+                                time.sleep(0.05)
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            os.unlink(out)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 return
@@ -1035,7 +1250,18 @@ class WavesAI:
         
         finally:
             # Always stop speaking state to resume listening
-            self.stop_speaking()
+            if started_speaking:
+                self._stop_fast_interrupt_listener()
+                try:
+                    if hasattr(self, 'echo_cancel'):
+                        self.echo_cancel.on_tts_stop()
+                except Exception:
+                    pass
+                self.stop_speaking()
+            try:
+                self._tts_guard_until = 0
+            except Exception:
+                pass
     
     def voice_mode(self):
         """New voice mode using sounddevice like the working prototype"""
@@ -1214,26 +1440,161 @@ class WavesAI:
         self.stop_listening = False
         
         def audio_callback(indata, frames, time_info, status):
-            # Check echo prevention / interrupt feature
+            # Fast interrupt while TTS is speaking using current input stream (no extra devices)
+            try:
+                # Reset simple interrupt counter when not speaking
+                if not self.conversation_state.get('is_speaking', False):
+                    try:
+                        self._simple_intr_count = 0
+                    except Exception:
+                        pass
+                # While processing (transcribe/LLM) but not speaking, allow fast interrupt on human speech
+                if (not self.conversation_state.get('is_speaking', False)
+                    and self.conversation_state.get('is_processing', False)
+                    and self.voice_config.get('fast_interrupt_enabled', True)):
+                    try:
+                        x_raw = indata[:, 0] if indata.ndim > 1 else indata
+                        x_raw = x_raw.astype(np.float32)
+                        x_raw = np.nan_to_num(x_raw, nan=0.0, posinf=0.0, neginf=0.0)
+                        x = x_raw.copy()
+                        if hasattr(self, 'apply_noise_reduction') and (
+                            self.voice_config.get('enable_noise_reduction') or self.voice_config.get('smart_noise_cancellation', True)
+                        ):
+                            x = self.apply_noise_reduction(x, config['sample_rate'])
+                        thr = float(self.voice_config.get('fast_interrupt_rms', 0.02))
+                        rms = float(np.sqrt(np.mean(np.square(x)))) if x.size > 0 else 0.0
+                        # Use ambient baseline when available
+                        try:
+                            baseline = vad.noise_floor if getattr(vad, 'is_calibrated', False) and vad.is_calibrated else config['vad_threshold']
+                        except Exception:
+                            baseline = config['vad_threshold']
+                        baseline_mult = float(self.voice_config.get('intr_baseline_mult', 1.25))
+                        abs_margin = float(self.voice_config.get('intr_abs_margin', 0.005))
+                        eff_thr = max(thr, baseline_mult * float(baseline) + abs_margin)
+                        # Require only 1 frame during processing for fastest cancellation
+                        frames_needed = 1
+                        self._proc_intr_count = getattr(self, '_proc_intr_count', 0)
+                        allow = True
+                        if hasattr(self, 'echo_cancel') and not self.voice_config.get('simple_interrupt', True):
+                            try:
+                                allow = bool(self.echo_cancel.should_allow_interrupt(x_raw))
+                            except Exception:
+                                allow = False
+                        if allow and rms >= eff_thr:
+                            self._proc_intr_count += 1
+                        else:
+                            self._proc_intr_count = 0
+                        if self._proc_intr_count >= frames_needed:
+                            self._proc_intr_count = 0
+                            self.request_interrupt()
+                    except Exception:
+                        pass
+                if self.conversation_state.get('is_speaking', False):
+                    # Respect initial guard window after TTS begins
+                    try:
+                        if getattr(self, '_tts_guard_until', 0) > 0 and time.time() < self._tts_guard_until:
+                            return
+                    except Exception:
+                        pass
+                    # Prepare raw and noise-reduced versions
+                    x_raw = indata[:, 0] if indata.ndim > 1 else indata
+                    # Sanitize raw
+                    try:
+                        x_raw = x_raw.astype(np.float32)
+                        x_raw = np.nan_to_num(x_raw, nan=0.0, posinf=0.0, neginf=0.0)
+                    except Exception:
+                        pass
+                    # Copy for NR (keep raw for echo canceller)
+                    x = x_raw.copy()
+                    try:
+                        if hasattr(self, 'apply_noise_reduction') and (
+                            self.voice_config.get('enable_noise_reduction') or self.voice_config.get('smart_noise_cancellation', True)
+                        ):
+                            x = self.apply_noise_reduction(x, config['sample_rate'])
+                    except Exception:
+                        pass
+                    # Prefer echo cancellation gating when available and not in simple mode
+                    if hasattr(self, 'echo_cancel') and not self.voice_config.get('simple_interrupt', True):
+                        try:
+                            method = getattr(self.echo_cancel, 'method', 'smart')
+                            thr = float(self.voice_config.get('fast_interrupt_rms', 0.02))
+                            rms_raw = float(np.sqrt(np.mean(np.square(x_raw.astype(np.float32))))) if x_raw.size > 0 else 0.0
+                            rms_nr = float(np.sqrt(np.mean(np.square(x.astype(np.float32))))) if x.size > 0 else 0.0
+                            rms = max(rms_raw, rms_nr)
+                            baseline = vad.noise_floor if getattr(vad, 'is_calibrated', False) and vad.is_calibrated else config['vad_threshold']
+                            # Use raw (pre-NR) for canceller correlation
+                            allow = self.echo_cancel.should_allow_interrupt(x_raw.astype(np.float32))
+                            baseline_mult = float(self.voice_config.get('intr_baseline_mult', 1.25))
+                            abs_margin = float(self.voice_config.get('intr_abs_margin', 0.005))
+                            eff_thr = max(thr, baseline_mult * float(baseline) + abs_margin)
+                            # Require only 1 frame while speaking for maximum responsiveness
+                            frames_needed = 1
+                            # Bypass canceller on strong speech
+                            try:
+                                bypass_mult = float(self.voice_config.get('intr_bypass_mult', 1.8))
+                                abs_high = float(self.voice_config.get('intr_abs_high', 0.06))
+                            except Exception:
+                                bypass_mult, abs_high = 1.8, 0.06
+                            bypass = (rms >= eff_thr * bypass_mult) or (rms >= abs_high)
+                            self._simple_intr_count = getattr(self, '_simple_intr_count', 0)
+                            if method == 'smart' and ((allow and rms >= eff_thr) or bypass):
+                                self._simple_intr_count += 1
+                            else:
+                                self._simple_intr_count = 0
+                            if self._simple_intr_count >= frames_needed:
+                                self._simple_intr_count = 0
+                                self.request_interrupt()
+                        except Exception:
+                            # If canceller fails, optionally allow RMS fallback only if fast interrupt is enabled
+                            pass
+                    # Fallback: RMS threshold only if enabled and no smart canceller
+                    if self.voice_config.get('fast_interrupt_enabled', True) and (not hasattr(self, 'echo_cancel') or self.voice_config.get('simple_interrupt', True)):
+                        thr = float(self.voice_config.get('fast_interrupt_rms', 0.02))
+                        # Use raw energy to avoid NR attenuation
+                        rms = float(np.sqrt(np.mean(np.square(x_raw)))) if x_raw.size > 0 else 0.0
+                        # Use ambient baseline when available to avoid false triggers in silence
+                        try:
+                            baseline = vad.noise_floor if getattr(vad, 'is_calibrated', False) and vad.is_calibrated else config['vad_threshold']
+                        except Exception:
+                            baseline = config['vad_threshold']
+                        eff_thr = max(thr, 2.0 * float(baseline))
+                        if self.voice_config.get('simple_interrupt', True):
+                            # Require only 1 frame while speaking
+                            frames_needed = 1
+                            self._simple_intr_count = getattr(self, '_simple_intr_count', 0)
+                            if rms >= eff_thr:
+                                self._simple_intr_count += 1
+                            else:
+                                self._simple_intr_count = 0
+                            if self._simple_intr_count >= frames_needed:
+                                self._simple_intr_count = 0
+                                self.request_interrupt()
+                        else:
+                            if rms >= eff_thr:
+                                self.request_interrupt()
+                    # Keep queuing audio even while speaking when echo canceller is active
+                    # This allows immediate recording for next prompt
+                    # (no return here)
+            except Exception:
+                # If anything goes wrong, fall back to normal behavior below
+                pass
+
+            # Skip audio input only if we lack smart echo cancellation
             if hasattr(self, 'should_ignore_audio') and self.should_ignore_audio():
-                return  # Don't queue audio during cooldown period
-
-            # If interrupt feature is enabled and AI is speaking, check for echo
-            if (hasattr(self, 'aec_system') and self.aec_system.get('enabled', False) and
-                self.conversation_state.get('is_speaking', False)):
-                # Use AEC to detect if this is echo or user interrupt
-                is_echo, confidence, is_interrupt = self.is_ai_echo(indata, sample_rate)
-                if is_echo:
-                    return  # Ignore echo from speakers
-
-                # If user is interrupting, mark it
-                if is_interrupt:
-                    self.conversation_state['interrupt_requested'] = True
-                    self.conversation_state['user_interrupted'] = True
-
+                if not (hasattr(self, 'echo_cancel') and not self.voice_config.get('simple_interrupt', True)):
+                    return  # Don't queue audio during AI speech or post-speech delay
+                
+            # Clean mic input using echo cancellation when available
+            src = indata
+            try:
+                if hasattr(self, 'echo_cancel') and not self.voice_config.get('simple_interrupt', True):
+                    src = self.echo_cancel.process_microphone_input(src.astype(np.float32))
+            except Exception:
+                src = indata
+            
             if not vad.is_calibrated:
-                vad.calibrate(indata)
-            audio_queue.put(indata.copy())
+                vad.calibrate(src)
+            audio_queue.put(src.copy())
         
         # Start stream
         print("\033[1;36m[Starting Audio]\033[0m Opening stream...")
@@ -1245,6 +1606,7 @@ class WavesAI:
             blocksize=int(sample_rate * 0.1)
         )
         stream.start()
+        self._voice_mode_stream_active = True
         
         # Calibration
         print("\033[1;36m[Calibrating]\033[0m Adjusting to ambient noise...")
@@ -1267,35 +1629,25 @@ class WavesAI:
                     try:
                         audio_chunk = audio_queue.get(timeout=0.1)
                     except queue.Empty:
-                        # Check if interrupt was requested while waiting
-                        if self.conversation_state.get('interrupt_requested', False):
-                            print("\n\033[1;33m[🛑 User interrupted AI]\033[0m")
-                            self.conversation_state['interrupt_requested'] = False
-                            # Reset recording state
-                            is_recording = False
-                            recording_buffer = []
                         continue
-
+                    
                     voice_detected, energy = vad.is_voice_detected(audio_chunk)
-
+                    
                     if voice_detected and not is_recording:
-                        # Check if this might be during AI speech (interrupt scenario)
-                        if self.conversation_state.get('is_speaking', False):
-                            # User is trying to speak during AI response
-                            print(f"\n\033[1;33m[⚠️  Interrupt Detected]\033[0m Energy: {energy:.4f}")
-                            self.request_interrupt()
-                            # Wait briefly for TTS to stop
-                            time.sleep(0.2)
-
                         print(f"\n\033[1;33m[🎤 Recording]\033[0m Energy: {energy:.4f}", end='', flush=True)
                         is_recording = True
                         recording_start = time.time()
                         recording_buffer = []
                         silence_start = None
-
+                        # Immediately interrupt any ongoing processing/LLM/tts
+                        try:
+                            self.request_interrupt()
+                        except Exception:
+                            pass
+                    
                     if is_recording:
                         recording_buffer.append(audio_chunk)
-
+                        
                         if not voice_detected:
                             if silence_start is None:
                                 silence_start = time.time()
@@ -1312,8 +1664,25 @@ class WavesAI:
                 
                 # Save and transcribe
                 audio_data = np.concatenate(recording_buffer, axis=0)
+                # Mark processing phase
+                try:
+                    self.conversation_state['is_processing'] = True
+                except Exception:
+                    pass
+                # Clear any prior interrupts for the new pipeline and snapshot generation
+                try:
+                    self.clear_interrupts()
+                except Exception:
+                    pass
+                gen = getattr(self, '_processing_generation', 0)
                 
                 # Apply smart noise cancellation before transcription
+                if self.is_canceled(gen):
+                    try:
+                        self.conversation_state['is_processing'] = False
+                    except Exception:
+                        pass
+                    continue
                 if hasattr(self, 'smart_noise_cancellation'):
                     try:
                         print(" \033[1;33m[🔇 Noise Reduction]\033[0m", end='', flush=True)
@@ -1322,6 +1691,12 @@ class WavesAI:
                         print(f" \033[1;31m[Noise reduction failed: {e}]\033[0m", end='', flush=True)
                 
                 # Save to temp file
+                if self.is_canceled(gen):
+                    try:
+                        self.conversation_state['is_processing'] = False
+                    except Exception:
+                        pass
+                    continue
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
                     # Normalize
                     max_val = np.max(np.abs(audio_data))
@@ -1342,6 +1717,12 @@ class WavesAI:
                 
                 # Transcribe
                 print("\033[1;36m[Transcribing]\033[0m", end='', flush=True)
+                if self.is_canceled(gen):
+                    try:
+                        self.conversation_state['is_processing'] = False
+                    except Exception:
+                        pass
+                    continue
                 try:
                     segments, _ = whisper_model.transcribe(
                         tmp_path,
@@ -1350,8 +1731,16 @@ class WavesAI:
                         vad_filter=True,
                         condition_on_previous_text=False
                     )
-                    
-                    text = " ".join([s.text for s in segments]).strip()
+                    # Incremental transcription with cooperative cancel
+                    text_parts = []
+                    for s in segments:
+                        if self.is_canceled(gen):
+                            break
+                        try:
+                            text_parts.append(s.text)
+                        except Exception:
+                            pass
+                    text = " ".join(text_parts).strip()
                     os.unlink(tmp_path)
                     
                     if text:
@@ -1380,25 +1769,50 @@ class WavesAI:
                             continue
                         
                         # Process with AI
-                        response = self.generate_response(text)
+                        if self.is_canceled(gen):
+                            try:
+                                self.conversation_state['is_processing'] = False
+                            except Exception:
+                                pass
+                            continue
+                        response = self.generate_response(text, generation=gen)
+                        if self.is_canceled(gen) or not response:
+                            try:
+                                self.conversation_state['is_processing'] = False
+                            except Exception:
+                                pass
+                            continue
                         print(f"\033[1;35m[WavesAI]\033[0m {response}")
                         
                         # TTS if available (with echo prevention)
                         if hasattr(self, 'tts_speak_advanced'):
+                            try:
+                                self.conversation_state['is_processing'] = False
+                            except Exception:
+                                pass
                             self.tts_speak_advanced(response[:500])
                     else:
                         print(" (no speech)")
+                        try:
+                            self.conversation_state['is_processing'] = False
+                        except Exception:
+                            pass
                         
                 except Exception as e:
                     print(f" ✗ {e}")
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
+                    try:
+                        self.conversation_state['is_processing'] = False
+                    except Exception:
+                        pass
                 
         except KeyboardInterrupt:
             print("\n\033[1;33m[Interrupted]\033[0m")
         finally:
             stream.stop()
             stream.close()
+            self._voice_mode_stream_active = False
             print("\033[1;35m[WavesAI]\033[0m Voice mode terminated.")
     
     def voice_mode_old(self):
@@ -1837,8 +2251,8 @@ class WavesAI:
             print(f"[ERROR] Failed to load model: {e}")
             return False
     
-    def generate_response(self, user_input: str) -> str:
-        """Generate AI response using loaded LLM with search context"""
+    def generate_response(self, user_input: str, generation: int = None) -> str:
+        """Generate AI response using loaded LLM with search context; cancel if generation superseded"""
         if not self.llm:
             return "Error: Model not loaded"
         
@@ -1852,6 +2266,12 @@ class WavesAI:
             any(indicator in user_input.lower() for indicator in file_indicators)):
             return self._handle_file_writing(user_input)
         
+        # Initialize generation snapshot
+        if generation is None:
+            generation = getattr(self, '_processing_generation', 0)
+        # Check for pending interrupt before any heavy prep
+        if self.is_canceled(generation) or self.check_interrupt():
+            return ""
         # Check if this is an information query - ALWAYS search the internet for facts
         search_context = ""
         
@@ -1869,10 +2289,14 @@ class WavesAI:
         
         # For news queries, use specialized news fetching
         if is_news_query:
+            if self.is_canceled(generation) or self.check_interrupt():
+                return ""
             try:
                 # Handle news queries with AI processing
                 region = self._detect_news_region(user_input)
                 print(f"\n[DEBUG] Fetching {region} news from internet...")
+                if self.is_canceled(generation) or self.check_interrupt():
+                    return ""
                 news_results = self.search_news(user_input, region)
                 print(f"[DEBUG] Fetched {len(news_results)} characters of news data")
                 print(f"[DEBUG] First 200 chars: {news_results[:200]}...")
@@ -1897,11 +2321,17 @@ The following news was JUST FETCHED from live news websites RIGHT NOW in {dateti
         
         # For ALL other information queries (not news, not commands), search the internet
         elif is_info_query and not is_command:
+            if self.is_canceled(generation) or self.check_interrupt():
+                return ""
             try:
                 print(f"\n[DEBUG] Information query detected, searching internet...")
                 
                 # Search both Wikipedia and Web for comprehensive results
+                if self.is_canceled(generation) or self.check_interrupt():
+                    return ""
                 wiki_results = self.search_wikipedia(user_input)
+                if self.is_canceled(generation) or self.check_interrupt():
+                    return ""
                 web_results = self.search_web(user_input)
                 
                 print(f"[DEBUG] Wikipedia: {len(wiki_results)} chars, Web: {len(web_results)} chars")
@@ -2000,6 +2430,8 @@ The following information was JUST FETCHED from the internet RIGHT NOW in {datet
         system_prompt = self.system_prompt_template.replace("{system_status}", system_status)
 
         # Llama 3.1 prompt format (without <|begin_of_text|> - model adds it automatically)
+        if self.is_canceled(generation) or self.check_interrupt():
+            return ""
         prompt = f"""<|start_header_id|>system<|end_header_id|>
 
 {system_prompt}{search_context}<|eot_id|><|start_header_id|>user<|end_header_id|>
@@ -2008,15 +2440,46 @@ The following information was JUST FETCHED from the internet RIGHT NOW in {datet
 
 """
 
+        # Cooperative cancellation: try streaming generation and break on interrupt
         try:
-            response = self.llm(
+            stream = self.llm(
                 prompt,
                 max_tokens=CONFIG["max_tokens"],
                 temperature=CONFIG["temperature"],
                 stop=["<|eot_id|>", "<|end_of_text|>", "User:", "[You]"],
-                echo=False
+                echo=False,
+                stream=True
             )
-            return response['choices'][0]['text'].strip()
+            pieces = []
+            for chunk in stream:
+                if self.is_canceled(generation) or self.check_interrupt():
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    return ""
+                try:
+                    token = chunk['choices'][0].get('text', '')
+                except Exception:
+                    token = ''
+                if token:
+                    pieces.append(token)
+            return ''.join(pieces).strip()
+        except TypeError:
+            # Fallback if streaming not supported
+            if self.is_canceled(generation) or self.check_interrupt():
+                return ""
+            try:
+                response = self.llm(
+                    prompt,
+                    max_tokens=CONFIG["max_tokens"],
+                    temperature=CONFIG["temperature"],
+                    stop=["<|eot_id|>", "<|end_of_text|>", "User:", "[You]"],
+                    echo=False
+                )
+                return response['choices'][0]['text'].strip()
+            except Exception as e:
+                return f"Error: {e}"
         except Exception as e:
             return f"Error: {e}"
     
@@ -2851,7 +3314,93 @@ How may I assist you?
         monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
         monitor_thread.start()
         return monitor_thread
-    
+
+    def detect_device_type(self) -> str:
+        """Detect whether the system is a laptop or desktop.
+        Heuristics:
+        - Battery presence via /sys/class/power_supply or /proc/acpi/battery
+        - DMI chassis_type codes
+        - upower battery listing (if available)
+        Defaults to 'desktop' when uncertain.
+        """
+        try:
+            # 1) Battery presence via power_supply
+            ps_path = Path('/sys/class/power_supply')
+            if ps_path.exists():
+                try:
+                    for child in ps_path.iterdir():
+                        name = child.name.lower()
+                        if name.startswith('bat') or 'battery' in name:
+                            return 'laptop'
+                except Exception:
+                    pass
+
+            # 2) DMI chassis type (numeric code)
+            dmi_file = Path('/sys/class/dmi/id/chassis_type')
+            if dmi_file.exists():
+                try:
+                    val = int(dmi_file.read_text().strip())
+                    laptop_types = {8, 9, 10, 11, 14}
+                    desktop_types = {3, 4, 5, 6, 7, 15}
+                    if val in laptop_types:
+                        return 'laptop'
+                    if val in desktop_types:
+                        return 'desktop'
+                except Exception:
+                    pass
+
+            # 3) upower battery listing
+            try:
+                upower_list = subprocess.check_output(['upower', '-e'], text=True, timeout=2)
+                if any('battery' in line.lower() for line in upower_list.splitlines()):
+                    return 'laptop'
+            except Exception:
+                pass
+
+            # 4) ACPI battery directory
+            acpi_bat = Path('/proc/acpi/battery')
+            if acpi_bat.exists():
+                try:
+                    if any(acpi_bat.iterdir()):
+                        return 'laptop'
+                except Exception:
+                    pass
+
+            # Fallback
+            return 'desktop'
+        except Exception:
+            return 'unknown'
+
+    def persist_device_type_to_config(self, device_type: str) -> None:
+        """Persist detected device type to ~/.wavesai/config/config.json under system.device_type"""
+        try:
+            config_path = Path.home() / '.wavesai' / 'config' / 'config.json'
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+
+            data = {}
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+
+            if not isinstance(data, dict):
+                data = {}
+            if 'system' not in data or not isinstance(data['system'], dict):
+                data['system'] = {}
+
+            # Only write if different to avoid unnecessary writes
+            if data['system'].get('device_type') != device_type:
+                data['system']['device_type'] = device_type
+                tmp_path = config_path.with_suffix('.tmp')
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp_path, config_path)
+        except Exception:
+            # Silently ignore persistence errors
+            pass
+
     def setup_sudo_access(self):
         """Setup sudo access with user confirmation - JARVIS style"""
         print("\n\033[1;35m[WavesAI]\033[0m ➜ Sir, some operations may require elevated privileges.")

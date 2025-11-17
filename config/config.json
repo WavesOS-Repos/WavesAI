@@ -1,7 +1,6 @@
 {
   "_comment": "WavesAI Configuration File",
   "_comment2": "Optimized for Intel i5 12th Gen + RTX 3050 8GB + 16GB RAM",
-  
   "model": {
     "path": "~/.wavesai/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
     "context_length": 8192,
@@ -12,16 +11,19 @@
     "use_mmap": true,
     "use_mlock": false
   },
-  
   "generation": {
     "temperature": 0.6,
     "top_p": 0.9,
     "top_k": 40,
     "repeat_penalty": 1.15,
     "max_tokens": 4096,
-    "stop_sequences": ["<|eot_id|>", "<|end_of_text|>", "User:", "[You]"]
+    "stop_sequences": [
+      "<|eot_id|>",
+      "<|end_of_text|>",
+      "User:",
+      "[You]"
+    ]
   },
-  
   "personality": {
     "style": "jarvis",
     "formality": "professional",
@@ -31,16 +33,15 @@
     "startup_greeting": true,
     "mission_mode_available": true
   },
-  
   "system": {
     "auto_execute_safe_commands": false,
     "dangerous_commands_blocked": true,
     "require_confirmation_for_sudo": true,
     "command_timeout": 30,
     "max_file_search_results": 50,
-    "max_process_list": 20
+    "max_process_list": 20,
+    "device_type": "desktop"
   },
-  
   "features": {
     "enable_web_search": true,
     "enable_weather": true,
@@ -53,7 +54,6 @@
     "enable_media_control": true,
     "enable_automation": true
   },
-  
   "network": {
     "search_engine": "duckduckgo",
     "default_location": "auto",
@@ -63,7 +63,6 @@
     "use_proxy": false,
     "proxy_url": ""
   },
-  
   "paths": {
     "database": "~/.wavesai/config/memory.db",
     "log_file": "~/.wavesai/config/logs/wavesai.log",
@@ -71,7 +70,6 @@
     "temp_dir": "/tmp/wavesai",
     "backup_dir": "~/.wavesai/config/backups"
   },
-  
   "logging": {
     "level": "INFO",
     "max_file_size": 10485760,
@@ -80,7 +78,6 @@
     "log_responses": true,
     "log_errors": true
   },
-  
   "memory": {
     "max_history_length": 100,
     "context_window_messages": 10,
@@ -88,7 +85,6 @@
     "auto_cleanup_days": 30,
     "remember_preferences": true
   },
-  
   "ui": {
     "color_scheme": "default",
     "use_colors": true,
@@ -97,7 +93,6 @@
     "ascii_art_logo": true,
     "notification_sound": false
   },
-  
   "performance": {
     "enable_gpu_monitoring": true,
     "enable_cpu_monitoring": true,
@@ -107,7 +102,6 @@
     "max_gpu_temp": 85,
     "max_cpu_temp": 90
   },
-  
   "automation": {
     "enable_cron_integration": true,
     "enable_systemd_timers": true,
@@ -115,7 +109,6 @@
     "auto_cleanup": true,
     "cleanup_interval": "weekly"
   },
-  
   "security": {
     "sandbox_mode": false,
     "whitelist_commands": [],
@@ -130,7 +123,6 @@
     "require_explicit_sudo": true,
     "log_security_events": true
   },
-  
   "integrations": {
     "hyprland": {
       "enabled": true,
@@ -152,7 +144,6 @@
       "default_color": "0080ff"
     }
   },
-  
   "custom_commands": {
     "aliases": {
       "update": "sudo pacman -Syu",
@@ -164,7 +155,6 @@
       "downloads": "cd ~/Downloads"
     }
   },
-  
   "experimental": {
     "enable_voice_input": false,
     "enable_voice_output": false,
@@ -174,7 +164,6 @@
     "enable_websocket": false,
     "websocket_port": 8081
   },
-  
   "presets": {
     "mission_mode": {
       "disable_notifications": true,
